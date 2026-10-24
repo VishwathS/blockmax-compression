@@ -1,0 +1,11 @@
+[package]
+name = "codecs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitpacking = "0.9.3"
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.12.0"
