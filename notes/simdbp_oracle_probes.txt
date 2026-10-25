@@ -1,0 +1,36 @@
+# build=sse RUSTFLAGS='' parker_commit=fa0ede5241ea913ec9e293bdbef0d0b1012e7f07 rustc="rustc 1.93.0-nightly (0df64c578 2025-11-17)"
+== probe, BLOCK_SIZE=128
+P1 stale cache: row A group 0 starts [0, 1, 2, 3]; after init(B), group 0 starts [0, 1, 2, 3]; expected [100, 101, 102, 103] -> REPRODUCED (returned row A's cached group)
+P1 control (fresh decompressor): group 0 of B starts [100, 101, 102, 103]
+P1 control (group 1 of A cached): group 0 of B starts [100, 101, 102, 103]
+P2 compress(vec![]): PANICS
+P2 Decompressor::new(0) + init(&[]): PANICS
+P3 compress([.., 300, ..]) decodes to 44
+P5: decompress_register only exists in AVX2 builds; skipped in this build
+
+# build=avx2 RUSTFLAGS='-C target-feature=+avx2' parker_commit=fa0ede5241ea913ec9e293bdbef0d0b1012e7f07 rustc="rustc 1.93.0-nightly (0df64c578 2025-11-17)"
+== probe, BLOCK_SIZE=256
+P1 stale cache: row A group 0 starts [0, 1, 2, 3]; after init(B), group 0 starts [0, 1, 2, 3]; expected [100, 101, 102, 103] -> REPRODUCED (returned row A's cached group)
+P1 control (fresh decompressor): group 0 of B starts [100, 101, 102, 103]
+P1 control (group 1 of A cached): group 0 of B starts [100, 101, 102, 103]
+P2 compress(vec![]): PANICS
+P2 Decompressor::new(0) + init(&[]): PANICS
+P3 compress([.., 300, ..]) decodes to 44
+P5 decompress_register width 1: wrong register offsets []
+P5 decompress_register width 2: wrong register offsets []
+P5 decompress_register width 3: wrong register offsets []
+P5 decompress_register width 4: wrong register offsets []
+P5 decompress_register width 5: wrong register offsets []
+P5 decompress_register width 6: wrong register offsets [10]
+P5 decompress_register width 7: wrong register offsets []
+P5 decompress_register width 8: wrong register offsets []
+
+# build=avx512 RUSTFLAGS='-C target-cpu=native' parker_commit=fa0ede5241ea913ec9e293bdbef0d0b1012e7f07 rustc="rustc 1.93.0-nightly (0df64c578 2025-11-17)"
+== probe, BLOCK_SIZE=512
+P1 stale cache: row A group 0 starts [0, 1, 2, 3]; after init(B), group 0 starts [0, 1, 2, 3]; expected [100, 101, 102, 103] -> REPRODUCED (returned row A's cached group)
+P1 control (fresh decompressor): group 0 of B starts [100, 101, 102, 103]
+P1 control (group 1 of A cached): group 0 of B starts [100, 101, 102, 103]
+P2 compress(vec![]): PANICS
+P2 Decompressor::new(0) + init(&[]): PANICS
+P3 compress([.., 300, ..]) decodes to 44
+P5: decompress_register only exists in AVX2 builds; skipped in this build

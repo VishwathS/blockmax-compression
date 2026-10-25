@@ -69,6 +69,12 @@ impl BlockCodec for VByte {
                 }
                 shift += 7;
             }
+            // Two bytes can hold up to 14 bits (e.g. [0x7F, 0xFF] = 16383), but `encode`
+            // only ever writes values <= 255. Anything larger means invalid input.
+            assert!(
+                value <= MAX_VALUE,
+                "VByte: decoded value {value} is above {MAX_VALUE}"
+            );
             *slot = value;
         }
         pos

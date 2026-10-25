@@ -1,0 +1,21 @@
+# Oracle: runs Parker's REAL SIMDBP code to produce golden test vectors.
+#
+# This crate is NOT part of the `codecs` build or tests (it has its own
+# `[workspace]` below, so cargo treats it as a separate project). It needs
+# Parker's repo next to this one (~/hierarchical_pruning), nightly Rust, and an
+# x86_64 CPU. See README.md and regenerate.sh.
+
+[package]
+name = "simdbp_oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An empty workspace table makes this directory its own workspace root, so it is
+# never mixed up with the `codecs` package in the repo root.
+[workspace]
+
+[dependencies]
+# Parker's crate, used read-only. Cargo builds it into this crate's target
+# directory (outside his repo); his build.rs writes only to OUT_DIR.
+bmp = { path = "../../../hierarchical_pruning" }

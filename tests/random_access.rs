@@ -3,7 +3,10 @@
 //!
 //! Every generated value is in 0..=255, the range the `BlockCodec` contract allows.
 
-use codecs::{BlockCodec, Bp128, Codec, GroupIndex, MAX_VALUE, RandomAccessCodec, Raw};
+use codecs::{
+    BlockCodec, Bp128, Codec, GroupIndex, MAX_VALUE, RandomAccessCodec, Raw, SimdBp128, SimdBp256,
+    SimdBp512,
+};
 use proptest::prelude::*;
 
 /// Encodes `input` with codec `C`, then checks every group two ways (one-shot
@@ -106,6 +109,40 @@ fn bp128_mixed_widths_have_the_expected_offsets() {
     check_all_groups::<Bp128>(&input);
 }
 
+/// Reads groups backwards, jumping around, and repeating, with codec `C`. Group g has
+/// values up to (2g mod 9) bits, so neighboring groups have different sizes.
+fn check_out_of_order<C: RandomAccessCodec>() {
+    let gl = C::GROUP_LEN;
+    let n = 4 * gl + gl / 3; // 4 full groups + a partial one
+    let input: Vec<u16> = (0..n)
+        .map(|i| {
+            let max = (1u32 << ((i / gl) * 2 % 9)) - 1; // widths 0, 2, 4, 6, 8
+            (i as u32 * 37 % (max + 1)) as u16
+        })
+        .collect();
+    let mut encoded = Vec::new();
+    C::encode(&input, &mut encoded);
+    let mut index = GroupIndex::<C>::new();
+    index.build(&encoded, n);
+    let mut out = vec![0u16; gl];
+    for g in [4, 0, 3, 1, 2, 2, 0, 4] {
+        let expected = &input[g * gl..((g + 1) * gl).min(n)];
+        let len = index.decode_group(&encoded, g, &mut out);
+        assert_eq!(&out[..len], expected, "group {g} (index)");
+        let len = C::decode_group(&encoded, n, g, &mut out);
+        assert_eq!(&out[..len], expected, "group {g} (one-shot)");
+    }
+}
+
+#[test]
+fn every_codec_can_read_groups_out_of_order() {
+    check_out_of_order::<Raw>();
+    check_out_of_order::<Bp128>();
+    check_out_of_order::<SimdBp128>();
+    check_out_of_order::<SimdBp256>();
+    check_out_of_order::<SimdBp512>();
+}
+
 #[test]
 fn groups_can_be_read_out_of_order() {
     let input = mixed_widths();
@@ -154,6 +191,9 @@ fn partial_last_group_writes_only_its_values() {
     let input: Vec<u16> = (0..300).map(|i| (i % 200) as u16).collect();
     check_all_groups::<Bp128>(&input);
     check_all_groups::<Raw>(&input);
+    check_all_groups::<SimdBp128>(&input);
+    check_all_groups::<SimdBp256>(&input);
+    check_all_groups::<SimdBp512>(&input);
 
     let mut encoded = Vec::new();
     Bp128::encode(&input, &mut encoded);
@@ -174,9 +214,18 @@ fn partial_last_group_writes_only_its_values() {
 
 #[test]
 fn single_value_and_exact_multiple_rows() {
-    for input in [vec![200], vec![5; 128], vec![17; 256]] {
+    for input in [
+        vec![200],
+        vec![5; 128],
+        vec![17; 256],
+        vec![9; 512],
+        vec![1; 1024],
+    ] {
         check_all_groups::<Bp128>(&input);
         check_all_groups::<Raw>(&input);
+        check_all_groups::<SimdBp128>(&input);
+        check_all_groups::<SimdBp256>(&input);
+        check_all_groups::<SimdBp512>(&input);
     }
 }
 
@@ -248,6 +297,30 @@ fn multiple_rows_in_one_buffer() {
     ];
     check_multiple_rows::<Bp128>(&rows);
     check_multiple_rows::<Raw>(&rows);
+    check_multiple_rows::<SimdBp128>(&rows);
+    check_multiple_rows::<SimdBp256>(&rows);
+    check_multiple_rows::<SimdBp512>(&rows);
+}
+
+/// Builds a `GroupIndex` for `input` with codec `C` and returns its RAM in bytes.
+fn index_heap_bytes<C: RandomAccessCodec>(input: &[u16]) -> usize {
+    let mut encoded = Vec::new();
+    C::encode(input, &mut encoded);
+    let mut index = GroupIndex::<C>::new();
+    index.build(&encoded, input.len());
+    assert_eq!(index.num_groups(), input.len().div_ceil(C::GROUP_LEN));
+    index.heap_bytes()
+}
+
+#[test]
+fn index_memory_is_one_usize_per_group_plus_one() {
+    // 600 values: 5 groups of 128, 3 of 256, 2 of 512. This RAM is separate from the
+    // encoded bytes, which don't grow.
+    let input = vec![1u16; 600];
+    let word = std::mem::size_of::<usize>();
+    assert!(index_heap_bytes::<Bp128>(&input) >= 6 * word);
+    assert!(index_heap_bytes::<SimdBp256>(&input) >= 4 * word);
+    assert!(index_heap_bytes::<SimdBp512>(&input) >= 3 * word);
 }
 
 #[test]
@@ -404,6 +477,29 @@ fn registry_reports_which_codecs_support_random_access() {
     assert_eq!(Codec::Raw.group_len(), Some(128));
     assert_eq!(Codec::VByte.group_len(), None);
     assert_eq!(Codec::Bp128.group_len(), Some(128));
+    assert_eq!(Codec::SimdBp128.group_len(), Some(128));
+    assert_eq!(Codec::SimdBp256.group_len(), Some(256));
+    assert_eq!(Codec::SimdBp512.group_len(), Some(512));
+}
+
+/// The one-shot `decode_group` of the codec type itself, written out by hand (like
+/// `encode_directly` in roundtrip.rs) so a registry arm pointing at the wrong codec
+/// would give different output.
+fn decode_group_directly(
+    codec: Codec,
+    input: &[u8],
+    n: usize,
+    g: usize,
+    out: &mut [u16],
+) -> Option<usize> {
+    match codec {
+        Codec::Raw => Some(Raw::decode_group(input, n, g, out)),
+        Codec::VByte => None,
+        Codec::Bp128 => Some(Bp128::decode_group(input, n, g, out)),
+        Codec::SimdBp128 => Some(SimdBp128::decode_group(input, n, g, out)),
+        Codec::SimdBp256 => Some(SimdBp256::decode_group(input, n, g, out)),
+        Codec::SimdBp512 => Some(SimdBp512::decode_group(input, n, g, out)),
+    }
 }
 
 #[test]
@@ -413,12 +509,23 @@ fn registry_decode_group_matches_direct_calls() {
     for codec in Codec::ALL {
         let mut encoded = Vec::new();
         codec.encode(&input, &mut encoded);
-        let mut out = [0u16; 128];
+        // Sized from the codec's own group length (not a fixed 128), so 256- and
+        // 512-value groups fit. VByte has no groups; 1 is just a placeholder size.
+        let mut out = vec![0u16; codec.group_len().unwrap_or(1)];
+        let mut direct = out.clone();
         match codec.group_len() {
             None => assert_eq!(codec.decode_group(&encoded, n, 0, &mut out), None),
             Some(group_len) => {
                 for g in 0..n.div_ceil(group_len) {
                     let len = codec.decode_group(&encoded, n, g, &mut out).unwrap();
+                    let direct_len = decode_group_directly(codec, &encoded, n, g, &mut direct);
+                    assert_eq!(Some(len), direct_len, "{} group {g}", codec.name());
+                    assert_eq!(
+                        out,
+                        direct,
+                        "{} group {g}: registry vs direct",
+                        codec.name()
+                    );
                     let expected = &input[g * group_len..((g + 1) * group_len).min(n)];
                     assert_eq!(&out[..len], expected, "{} group {g}", codec.name());
                 }
@@ -470,10 +577,19 @@ proptest! {
         check_all_groups::<Raw>(&input);
     }
 
+    #[test]
+    fn simdbp_random_access_matches_sequential_mixed_widths(input in row_with_mixed_widths()) {
+        check_all_groups::<SimdBp128>(&input);
+        check_all_groups::<SimdBp256>(&input);
+        check_all_groups::<SimdBp512>(&input);
+    }
+
     /// Random rows appended to one buffer, read back group by group.
     #[test]
     fn multiple_random_rows(rows in prop::collection::vec(row_with_mixed_widths(), 1..5)) {
         check_multiple_rows::<Bp128>(&rows);
         check_multiple_rows::<Raw>(&rows);
+        check_multiple_rows::<SimdBp128>(&rows);
+        check_multiple_rows::<SimdBp512>(&rows);
     }
 }

@@ -1,0 +1,5 @@
+# Parker's crate uses `#![feature(...)]`, so it only builds on this nightly
+# (the one his repo is developed with). This file only applies inside this
+# directory; the `codecs` crate itself builds on stable.
+[toolchain]
+channel = "nightly-2025-11-18"

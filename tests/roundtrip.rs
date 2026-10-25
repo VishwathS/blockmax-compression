@@ -2,7 +2,7 @@
 //!
 //! Every generated value is in 0..=255, the range the `BlockCodec` contract allows.
 
-use codecs::{BlockCodec, Bp128, Codec, MAX_VALUE, Raw, VByte};
+use codecs::{BlockCodec, Bp128, Codec, MAX_VALUE, Raw, SimdBp128, SimdBp256, SimdBp512, VByte};
 use proptest::prelude::*;
 
 /// Encodes `input` with codec `C`, decodes it again, and checks that we get the same
@@ -67,6 +67,16 @@ fn bp128_roundtrips_fixed_cases() {
     }
 }
 
+#[test]
+fn simdbp_roundtrips_fixed_cases() {
+    for (name, input) in fixed_cases() {
+        println!("SimdBp: {name}");
+        roundtrip::<SimdBp128>(&input);
+        roundtrip::<SimdBp256>(&input);
+        roundtrip::<SimdBp512>(&input);
+    }
+}
+
 /// Encodes a long input as several BLOCK_SIZE blocks written into one buffer, then
 /// decodes them one by one, using each `decode`'s return value to find the next block.
 fn roundtrip_in_blocks<C: BlockCodec>(input: &[u16]) {
@@ -93,6 +103,9 @@ fn blocks_can_be_decoded_back_to_back() {
     roundtrip_in_blocks::<Raw>(&input);
     roundtrip_in_blocks::<VByte>(&input);
     roundtrip_in_blocks::<Bp128>(&input);
+    roundtrip_in_blocks::<SimdBp128>(&input);
+    roundtrip_in_blocks::<SimdBp256>(&input);
+    roundtrip_in_blocks::<SimdBp512>(&input);
 }
 
 /// Like `roundtrip_in_blocks`, but the pieces have different, arbitrary lengths
@@ -125,6 +138,9 @@ fn concatenated_encodes_decode_in_order() {
     roundtrip_concatenated::<Raw>(&pieces);
     roundtrip_concatenated::<VByte>(&pieces);
     roundtrip_concatenated::<Bp128>(&pieces);
+    roundtrip_concatenated::<SimdBp128>(&pieces);
+    roundtrip_concatenated::<SimdBp256>(&pieces);
+    roundtrip_concatenated::<SimdBp512>(&pieces);
 }
 
 // ---------- exact-byte tests ----------
@@ -183,6 +199,29 @@ fn vbyte_panics_on_three_byte_value() {
     // Two bytes without the flag, then a third: no value <= 255 encodes like this.
     let mut out = [0u16; 1];
     VByte::decode(&[0x00, 0x00, 0x81], &mut out);
+}
+
+#[test]
+#[should_panic(expected = "decoded value 16383 is above 255")]
+fn vbyte_panics_on_a_two_byte_value_above_255() {
+    // 0x7F (low 7 bits all set, more to come) then 0xFF (7 more bits, last byte) is
+    // 14 one-bits = 16383. It's 2 bytes long, but `encode` never writes it.
+    let mut out = [0u16; 1];
+    VByte::decode(&[0x7F, 0xFF], &mut out);
+}
+
+#[test]
+fn vbyte_accepts_the_largest_valid_two_byte_value() {
+    // The boundary of the check above: 255 = [0x7F, 0x81] still decodes.
+    let mut out = [0u16; 1];
+    assert_eq!(VByte::decode(&[0x7F, 0x81], &mut out), 2);
+    assert_eq!(out, [255]);
+}
+
+#[test]
+#[should_panic(expected = "need 5 bytes")]
+fn raw_panics_on_truncated_input() {
+    Raw::decode(&[1, 2, 3, 4], &mut [0u16; 5]);
 }
 
 // ---------- Bp128 format tests ----------
@@ -308,6 +347,13 @@ fn vbyte_rejects_values_above_255() {
 
 #[test]
 #[should_panic(expected = "above 255")]
+fn simdbp_rejects_values_above_255() {
+    // Parker's `compress` would silently keep only the low 8 bits (300 -> 44).
+    SimdBp512::encode(&[300], &mut Vec::new());
+}
+
+#[test]
+#[should_panic(expected = "above 255")]
 fn bp128_rejects_values_above_255() {
     // The bad value sits in the second chunk, after a valid first chunk.
     let mut input = vec![0u16; 200];
@@ -323,10 +369,30 @@ fn bp128_rejects_values_above_255() {
 #[test]
 fn registry_lists_exactly_the_implemented_codecs() {
     // Update this list (and only this list) when a codec is added.
-    assert_eq!(Codec::ALL, [Codec::Raw, Codec::VByte, Codec::Bp128]);
+    assert_eq!(
+        Codec::ALL,
+        [
+            Codec::Raw,
+            Codec::VByte,
+            Codec::Bp128,
+            Codec::SimdBp128,
+            Codec::SimdBp256,
+            Codec::SimdBp512
+        ]
+    );
     let names: Vec<&str> = Codec::ALL.iter().map(|codec| codec.name()).collect();
     // These exact strings appear in reports, so they must not change by accident.
-    assert_eq!(names, ["Raw", "VByte", "Bp128"]);
+    assert_eq!(
+        names,
+        [
+            "Raw",
+            "VByte",
+            "Bp128",
+            "SimdBp128",
+            "SimdBp256",
+            "SimdBp512"
+        ]
+    );
 }
 
 #[test]
@@ -351,6 +417,9 @@ fn encode_directly(codec: Codec, input: &[u16]) -> Vec<u8> {
         Codec::Raw => Raw::encode(input, &mut out),
         Codec::VByte => VByte::encode(input, &mut out),
         Codec::Bp128 => Bp128::encode(input, &mut out),
+        Codec::SimdBp128 => SimdBp128::encode(input, &mut out),
+        Codec::SimdBp256 => SimdBp256::encode(input, &mut out),
+        Codec::SimdBp512 => SimdBp512::encode(input, &mut out),
     }
     out
 }
@@ -360,6 +429,9 @@ fn registry_matches_the_codec_types() {
     assert_eq!(Codec::Raw.block_size(), Raw::BLOCK_SIZE);
     assert_eq!(Codec::VByte.block_size(), VByte::BLOCK_SIZE);
     assert_eq!(Codec::Bp128.block_size(), Bp128::BLOCK_SIZE);
+    assert_eq!(Codec::SimdBp128.block_size(), 128);
+    assert_eq!(Codec::SimdBp256.block_size(), 256);
+    assert_eq!(Codec::SimdBp512.block_size(), 512);
 
     for codec in Codec::ALL {
         for (name, input) in fixed_cases() {
@@ -398,9 +470,12 @@ fn registry_concatenated_encodes_decode_in_order() {
 }
 
 #[test]
-#[should_panic(expected = "above 255")]
 fn registry_encode_keeps_the_range_check() {
-    Codec::Bp128.encode(&[256], &mut Vec::new());
+    // Every codec in the registry must reject 256, in debug and release builds.
+    for codec in Codec::ALL {
+        let result = std::panic::catch_unwind(|| codec.encode(&[1, 256], &mut Vec::new()));
+        assert!(result.is_err(), "{} accepted 256", codec.name());
+    }
 }
 
 // ---------- property tests ----------
@@ -429,6 +504,13 @@ proptest! {
         roundtrip::<Bp128>(&input);
     }
 
+    #[test]
+    fn simdbp_roundtrips_random(input in block()) {
+        roundtrip::<SimdBp128>(&input);
+        roundtrip::<SimdBp256>(&input);
+        roundtrip::<SimdBp512>(&input);
+    }
+
     /// The same random input through every codec in the registry.
     #[test]
     fn registry_roundtrips_random(input in block()) {
@@ -452,5 +534,8 @@ proptest! {
         })
     ) {
         roundtrip::<Bp128>(&input);
+        roundtrip::<SimdBp128>(&input);
+        roundtrip::<SimdBp256>(&input);
+        roundtrip::<SimdBp512>(&input);
     }
 }

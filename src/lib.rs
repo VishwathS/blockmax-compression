@@ -13,13 +13,17 @@
 //! [`registry`] module.
 //!
 //! To decode one group of values without decoding a whole row, use
-//! [`RandomAccessCodec`] (implemented by `Raw` and `Bp128`) and optionally a
+//! [`RandomAccessCodec`] (implemented by every codec except `VByte`) and optionally a
 //! [`GroupIndex`]; see the [`random_access`] module.
+//!
+//! [`SimdBp128`], [`SimdBp256`], and [`SimdBp512`] are Parker's SIMDBP format (see the
+//! [`simdbp`] module), so his index's bytes can be compared with the other codecs.
 
 pub mod bp128;
 pub mod random_access;
 pub mod raw;
 pub mod registry;
+pub mod simdbp;
 pub mod vbyte;
 
 // Re-export the codec types so users can write `codecs::Raw` instead of `codecs::raw::Raw`.
@@ -27,6 +31,7 @@ pub use bp128::Bp128;
 pub use random_access::{GroupIndex, RandomAccessCodec};
 pub use raw::Raw;
 pub use registry::Codec;
+pub use simdbp::{SimdBp128, SimdBp256, SimdBp512};
 pub use vbyte::VByte;
 
 /// The largest value a codec has to handle. Inputs above this break the contract.

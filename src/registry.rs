@@ -27,7 +27,7 @@
 //! 4. Update the expected list in the `registry_lists_exactly_the_implemented_codecs`
 //!    test (`tests/roundtrip.rs`).
 
-use crate::{BlockCodec, Bp128, RandomAccessCodec, Raw, VByte};
+use crate::{BlockCodec, Bp128, RandomAccessCodec, Raw, SimdBp128, SimdBp256, SimdBp512, VByte};
 
 /// One variant per codec. `Copy` because it's just a tag (one byte), so passing it
 /// around by value is free.
@@ -36,11 +36,21 @@ pub enum Codec {
     Raw,
     VByte,
     Bp128,
+    SimdBp128,
+    SimdBp256,
+    SimdBp512,
 }
 
 impl Codec {
     /// Every codec, in the order reports print them (baseline first).
-    pub const ALL: [Codec; 3] = [Codec::Raw, Codec::VByte, Codec::Bp128];
+    pub const ALL: [Codec; 6] = [
+        Codec::Raw,
+        Codec::VByte,
+        Codec::Bp128,
+        Codec::SimdBp128,
+        Codec::SimdBp256,
+        Codec::SimdBp512,
+    ];
 
     /// The codec's name, as used in reports and (later) on the command line. Treat
     /// these as stable: changing one would break scripts and saved results.
@@ -49,6 +59,9 @@ impl Codec {
             Codec::Raw => "Raw",
             Codec::VByte => "VByte",
             Codec::Bp128 => "Bp128",
+            Codec::SimdBp128 => "SimdBp128",
+            Codec::SimdBp256 => "SimdBp256",
+            Codec::SimdBp512 => "SimdBp512",
         }
     }
 
@@ -66,6 +79,9 @@ impl Codec {
             Codec::Raw => Raw::BLOCK_SIZE,
             Codec::VByte => VByte::BLOCK_SIZE,
             Codec::Bp128 => Bp128::BLOCK_SIZE,
+            Codec::SimdBp128 => SimdBp128::BLOCK_SIZE,
+            Codec::SimdBp256 => SimdBp256::BLOCK_SIZE,
+            Codec::SimdBp512 => SimdBp512::BLOCK_SIZE,
         }
     }
 
@@ -76,6 +92,9 @@ impl Codec {
             Codec::Raw => Raw::encode(input, out),
             Codec::VByte => VByte::encode(input, out),
             Codec::Bp128 => Bp128::encode(input, out),
+            Codec::SimdBp128 => SimdBp128::encode(input, out),
+            Codec::SimdBp256 => SimdBp256::encode(input, out),
+            Codec::SimdBp512 => SimdBp512::encode(input, out),
         }
     }
 
@@ -86,6 +105,9 @@ impl Codec {
             Codec::Raw => Raw::decode(input, out),
             Codec::VByte => VByte::decode(input, out),
             Codec::Bp128 => Bp128::decode(input, out),
+            Codec::SimdBp128 => SimdBp128::decode(input, out),
+            Codec::SimdBp256 => SimdBp256::decode(input, out),
+            Codec::SimdBp512 => SimdBp512::decode(input, out),
         }
     }
 
@@ -96,6 +118,9 @@ impl Codec {
             Codec::Raw => Some(Raw::GROUP_LEN),
             Codec::VByte => None,
             Codec::Bp128 => Some(Bp128::GROUP_LEN),
+            Codec::SimdBp128 => Some(SimdBp128::GROUP_LEN),
+            Codec::SimdBp256 => Some(SimdBp256::GROUP_LEN),
+            Codec::SimdBp512 => Some(SimdBp512::GROUP_LEN),
         }
     }
 
@@ -113,6 +138,9 @@ impl Codec {
             Codec::Raw => Some(Raw::decode_group(input, n, group, out)),
             Codec::VByte => None,
             Codec::Bp128 => Some(Bp128::decode_group(input, n, group, out)),
+            Codec::SimdBp128 => Some(SimdBp128::decode_group(input, n, group, out)),
+            Codec::SimdBp256 => Some(SimdBp256::decode_group(input, n, group, out)),
+            Codec::SimdBp512 => Some(SimdBp512::decode_group(input, n, group, out)),
         }
     }
 }

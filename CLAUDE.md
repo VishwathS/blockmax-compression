@@ -42,6 +42,12 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
   We add `--target-dir ~/hp-target` so build output stays outside Parker's tree. Binaries
   are in `~/hp-target/release/`. This machine (i7-11800H) has AVX-512, so the build uses
   the SIMDBP **AVX-512 path (groups of 512, 32 u16s per register)**.
+- Issues found in his SIMDBP code in stage 6, reproduced with his public API (details
+  and exact conditions in `notes/design_decisions.md` section 4; his repo untouched):
+  P1 `Decompressor::init` doesn't reset the cached group, so a reused decompressor can
+  return the previous row's group (search reuses them across queries; effect on search
+  results NOT tested); P2 empty rows panic; P3 values > 255 are silently truncated
+  (300 → 44); P5 AVX2 `decompress_register` is wrong for width 6, offset 10 (dead code).
 
 ## This crate (codecs)
 - `BlockCodec` trait in `src/lib.rs`. Contract:
@@ -68,18 +74,20 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
     doesn't allocate once its `Vec` is big enough. RAM cost: 8 bytes × (G+1), about
     0.0625 B/value for 128-value groups, held only while a row is open; nothing is
     added to the encoded bytes. `heap_bytes()` reports it.
-  - Supported: `Raw` (group = 128 bytes at `128 × g`, O(1) without an index) and
+  - Supported: `Raw` (group = 128 bytes at `128 × g`, O(1) without an index),
     `Bp128` (group = one 128-value chunk; one-shot locate sums the g width bytes before
-    it, **O(g)**, so use `GroupIndex` for many lookups; decode = one 128-value unpack).
+    it, **O(g)**, so use `GroupIndex` for many lookups; decode = one 128-value unpack),
+    and `SimdBp128/256/512` (group = one SIMDBP group of 128/256/512; one-shot locate
+    sums the g 4-bit header fields before it, **O(g)**).
     `VByte` does **not** implement it: positions depend on every earlier value.
   - Registry: `Codec::group_len()` (`None` for VByte) and `Codec::decode_group()`
     (returns `Option<usize>`).
   - Invalid group index, too-small `out`, or truncated/invalid input → panic with a
     message ("out of range", "room for", "input ended", "width bytes", ...).
   - Relation to Parker's SIMDBP: same idea as `Decompressor::init` (prefix sum of the
-    widths, O(G)) + `decompress_block` (O(1) locate, decode the whole group). Differences:
-    128-value groups (his AVX-512 build: 512), 1-byte widths (his: 4 bits), no metablocks,
-    no cached "current group" inside the index (the caller owns the output buffer).
+    widths, O(G)) + `decompress_block` (O(1) locate, decode the whole group), but with
+    no cached "current group" inside the index (the caller owns the output buffer),
+    which avoids his stale-cache issue (P1).
 - Codecs (all implemented and tested):
   - `src/raw.rs`: `Raw`, 1 byte/value, the baseline, same as Parker's `BlockData::Raw`.
   - `src/vbyte.rs`: `VByte`, 7-bit groups, low-order first, stop bit = high bit set on
@@ -93,8 +101,24 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
     zero-padded to 128 (like SIMDBP's last group). u16 is widened to u32 for the crate.
   - Caveat: the crate uses a scalar packer in debug builds and SIMD in release builds.
     `bp128_known_bytes` pins the bytes, so run `cargo test --release` too.
+  - `src/simdbp/`: `SimdBp128` / `SimdBp256` / `SimdBp512` (= `SimdBp<STRIDE>` with
+    STRIDE 8 / 16 / 32), **Parker's SIMDBP format, byte-identical to his `compress`**
+    (u16 words stored little-endian). Format: `[M metablock headers, 8 × STRIDE bytes
+    each][group data, 2 × STRIDE × width bytes each]`; group = 16 × STRIDE values packed
+    at the bit width of their max in his lane layout; header = the groups' widths as 4-bit
+    fields (same lane layout); one metablock = 16 × STRIDE groups; last group zero-padded;
+    `n = 0` → no bytes (his code panics). All three exist in every build (his code picks
+    one at compile time). Packing uses `simdbp::Kernel`: `Scalar` (port of his
+    `pack_scalar`) or his generated SSE3 / AVX2 / AVX-512 (F+BW) kernels, chosen at run
+    time by `Kernel::best`; all give the same bytes. The kernels in
+    `src/simdbp/kernels/{sse3,avx2,avx512}.rs` are vendored by
+    `scripts/vendor_simdbp_kernels.py` (Apache-2.0; `third_party/hierarchical_pruning/`
+    has the license and provenance): **never edit them by hand**, re-run the script.
+    Every row pays at least one header (64 / 128 / 256 bytes), so encode a long sequence
+    (e.g. a term's whole level) as one row.
 - Codec registry: `src/registry.rs`, re-exported as `codecs::Codec`. An enum with one
-  variant per codec; `Codec::ALL` lists them all (Raw, VByte, Bp128), `name()` gives a
+  variant per codec; `Codec::ALL` lists them all (Raw, VByte, Bp128, SimdBp128,
+  SimdBp256, SimdBp512), `name()` gives a
   stable display name, `from_name()` looks one up (case-insensitive), and
   `block_size()` / `encode()` / `decode()` forward to the codec type via `match`. It
   doesn't change the trait or any byte format. Anything that loops over codecs
@@ -106,19 +130,34 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
   3. add an arm to each `match` in `registry.rs` (the compiler flags any missing one;
      `group_len` / `decode_group` return `None` for codecs without random access)
   4. update the expected list in the `registry_lists_exactly_the_implemented_codecs` test
-- Size report: `cargo run --release --example size_report` (synthetic datasets, one
-  bytes-per-value column per registered codec). Its unit test runs with `cargo test`
-  (`test = true` in `Cargo.toml`).
+- Size report: `cargo run --release --example size_report`. SYNTHETIC datasets only
+  (labelled as such; not research results). Each dataset is encoded as **one row**
+  (encoding many short rows would charge SIMDBP a header per row). Table 1: encoded
+  bytes per value per registered codec; table 2: `GroupIndex` RAM per value, kept
+  separate (it isn't stored). Its unit tests run with `cargo test` (`test = true` in
+  `Cargo.toml`).
 - Tests are in `tests/roundtrip.rs` (generic roundtrip helper + proptest, exact-format
-  tests, panic tests, registry tests that compare registry output with direct calls)
-  and `tests/random_access.rs` (every group, one-shot and via `GroupIndex`, checked
-  against sequential `decode`; exact Bp128 offsets; out-of-order access; zero and
-  partial groups; several rows in one buffer; invalid indices and truncated input;
-  proptest with per-group random widths).
-- Open design questions (details in `notes/code_map.md` section (c)): parameterized
-  codecs as enum variants with fields, measuring `match` dispatch cost in stage 8,
-  how SIMDBP's 512-value groups and metablock headers map onto `RandomAccessCodec`
-  (stage 6), and whether `GroupIndex` should store `u32` offsets to halve its RAM.
+  tests, panic tests, registry tests that compare registry output with direct calls),
+  `tests/random_access.rs` (every group, one-shot and via `GroupIndex`, checked
+  against sequential `decode`, for every random-access codec; exact Bp128 offsets;
+  out-of-order access; zero and partial groups; several rows in one buffer; invalid
+  indices and truncated input; proptest with per-group random widths),
+  `tests/simdbp.rs` (**golden vectors from Parker's own code**, hand-computed bytes,
+  scalar vs SIMD kernels, invalid input), and `tests/end_to_end.rs` (one 270,001-value
+  row through the registry for every codec, with sizes computed independently).
+- Golden vectors: `tests/data/simdbp/simdbp{128,256,512}.txt`, produced by
+  `tools/simdbp_oracle` (a separate nightly crate that depends on Parker's repo
+  read-only; NOT part of `cargo test`). Regenerate with
+  `tools/simdbp_oracle/regenerate.sh` (see its README). `cargo test` needs only the
+  committed files. Set `CODECS_REQUIRE_SIMD=1` to make the tests fail if the SSE3 /
+  AVX2 / AVX-512 kernels aren't all available (proves the SIMD paths ran).
+- Design decisions (all of them, with class A/B/C/D, evidence, and whether they were
+  changed or deferred), what is confirmed compatible with Parker's code vs only
+  self-consistent, and measured results vs hypotheses: `notes/design_decisions.md`.
+- Open design questions: parameterized codecs as enum variants with fields, measuring
+  `match` dispatch cost in stage 8, whether `GroupIndex` should store `u32` offsets to
+  halve its RAM, zero-copy SIMDBP decode (bytes are copied into a stack buffer now),
+  and panics vs `Result` once files are read from disk (stage 5).
 - Before committing, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, and `cargo test --release` must all pass. This crate builds on stable;
   the nightly toolchain is only for Parker's repo.
@@ -128,11 +167,12 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
 Done: (1) BlockCodec trait + Raw + VByte, (2) switch to u16 values <= 255, (3) BP128,
 (4) codec registry (`codecs::Codec`, size report loops over it), random access
 (`RandomAccessCodec` + `GroupIndex`, for Raw and Bp128; branch `feature/random-access`;
-no byte format changed, size report identical).
+no byte format changed, size report identical), (6, done before 5) SIMDBP integration
+(`SimdBp128/256/512`, byte-identical to Parker's `compress`, verified with golden vectors
+from his code; VByte decode now rejects values > 255; size report encodes one row per
+dataset; branch `feature/simdbp-integration`).
 Next, in order (do not start one without the user saying "continue"):
 5. Real index loader: read `export_data` matrices (`u32 n_terms`, `u32 n_blocks`, u8
    T×C grid) so codecs run on real MS MARCO block maxes instead of synthetic data.
-6. SIMDBP integration: port or call Parker's SIMDBP format as a codec, to compare
-   against it directly (read-only use of his repo).
 7. CLI: run size/speed reports on a chosen dataset and codec set.
 8. Benchmarking: criterion encode/decode speed, and bytes per value on real data.
