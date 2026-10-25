@@ -109,6 +109,19 @@ fn generate(spec: &str, n: usize, gl: usize) -> Vec<u16> {
                 })
                 .collect()
         }
+        // Every group has width exactly W: its first value is 2^W - 1, the rest are
+        // random W-bit values. So every header slot that is used holds W.
+        "groupmax" => {
+            let w = num(1) as u32;
+            let mask = ((1u32 << w) - 1) as u16;
+            let mut rng = XorShift64(num(2));
+            (0..n)
+                .map(|i| {
+                    let r = rng.next() as u16 & mask;
+                    if i % gl == 0 { mask } else { r }
+                })
+                .collect()
+        }
         // Group g has a pseudo-random width 0..=8, taken from a multiplicative hash of
         // g and SEED (not from the value stream). Each group's first value is its max.
         "randgroups" => {
@@ -172,6 +185,13 @@ fn cases(gl: usize) -> Vec<(String, usize, String)> {
         ("all_header_fields".into(), 2 * gl * gl + 5 * gl + 7, "headers:20".into()),
         // Random per-group widths across a metablock boundary.
         ("random_group_widths".into(), gl * gl + 3 * gl + 1, "randgroups:21".into()),
+        // Width 8 (header field 0b1000) in every slot of metablocks 0 and 1, then 2
+        // groups in metablock 2 (the last one is a single value).
+        ("width8_every_slot".into(), 2 * gl * gl + gl + 1, "groupmax:8:22".into()),
+        // Width 7 (header field 0b0111) in every slot of metablock 0, then a single
+        // 1-value group in metablock 1. With the case above, each of the 4 bits of
+        // every header field is both set and clear in some case.
+        ("width7_every_slot".into(), gl * gl + 1, "groupmax:7:23".into()),
     ]);
     cases
 }

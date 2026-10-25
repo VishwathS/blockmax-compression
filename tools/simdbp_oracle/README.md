@@ -61,9 +61,13 @@ each width 0..=8, GL/2 + 3, GL + 1, GL − 1, 3·GL, all 255, 20 groups with wid
 cycling 0..=8, an invented block-max-like mix, GL² (one full metablock),
 GL² + 2·GL + 9 (second metablock), 2·GL² + 1 (third metablock with one value),
 2·GL² + 5·GL + 7 with every header slot nonzero across three metablocks
-(`headers:20`), and GL² + 3·GL + 1 with random per-group widths (`randgroups:21`).
-With 32 KiB as the limit, every case has full bytes at 128; at 256 and 512 the last two
-cases have only `words` + `bytes_fnv`.
+(`headers:20`), GL² + 3·GL + 1 with random per-group widths (`randgroups:21`),
+2·GL² + GL + 1 with width 8 in every group (`groupmax:8:22`: every slot of two whole
+metablocks, then 2 groups in a third), and GL² + 1 with width 7 in every group
+(`groupmax:7:23`: every slot of one metablock, then 1 value in a second). 25 cases.
+With 32 KiB as the limit, 24 cases have full bytes at 128 (all but
+`width8_every_slot`); at 256 and 512 the last four cases have only `words` +
+`bytes_fnv`.
 
 ### Hash algorithm
 
@@ -82,9 +86,11 @@ differences, which is all these comparisons need.
    for that input, with a negligible chance of coincidence; it is not a byte diff.)
 3. Decodes his bytes (or ours, once they match) and checks widths, offsets, random
    access, and the transcode hashes.
-4. `golden_cases_cover_every_header_field` checks, from his widths, that the cases put
-   a nonzero width in every header slot (every word, 4-bit position, and lane) in at
-   least three metablocks.
+4. `golden_cases_cover_every_header_bit` checks, from his widths, that the cases put a
+   nonzero width in every header slot (every word, 4-bit position, and lane); that
+   each of the 4 bits of every slot's field is 1 in some case and 0 in another; that
+   one case has width 8 in every slot of at least two whole metablocks; and that
+   nonzero widths appear in at least three metablocks.
 
 ### Checking that the committed files are reproducible
 

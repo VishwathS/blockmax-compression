@@ -151,7 +151,7 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
   against sequential `decode`, for every random-access codec; exact Bp128 offsets;
   out-of-order access; zero and partial groups; several rows in one buffer; invalid
   indices and truncated input; proptest with per-group random widths),
-  `tests/simdbp.rs` (**golden vectors from Parker's own code**, header-slot coverage,
+  `tests/simdbp.rs` (**golden vectors from Parker's own code**, header-bit coverage,
   hand-computed bytes, scalar vs SIMD kernels, invalid input), `tests/bp128_layout.rs`
   (Bp128 bytes vs an independent model of the BitPacker4x layout, widths 0..=8),
   `tests/contracts.rs` (B1 buffer unchanged after a rejected value, P1-style stale-index
@@ -162,7 +162,7 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
   with sizes computed independently), and the unit tests in
   `src/simdbp/kernel_selection_tests.rs` (which kernel ran). `notes/code_map.md` has a
   table of what each file proves and whether it is independent of our own decoder.
-- Golden vectors: `tests/data/simdbp/simdbp{128,256,512}.txt`, 23 cases each, produced
+- Golden vectors: `tests/data/simdbp/simdbp{128,256,512}.txt`, 25 cases each, produced
   by `tools/simdbp_oracle` (a separate nightly crate that depends on Parker's repo
   read-only; NOT part of `cargo test`). Outputs up to 32 KiB are stored in full; larger
   ones as length + FNV-1a 64 hash (`bytes_fnv`); every case stores `input_fnv` so the
@@ -197,7 +197,8 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
    `feature/random-access`; no byte format changed). Done.
 5. Parker SIMDBP integration and comprehensive correctness audit (**current**, branch
    `feature/simdbp-integration`): `SimdBp128/256/512`, byte-identical to Parker's
-   `compress` (golden vectors from his code, every header slot covered); VByte decode
+   `compress` (golden vectors from his code; every bit of every header slot is 1 in some
+   case and 0 in another, and width 8 fills every slot of two metablocks); VByte decode
    rejects values > 255; size report encodes one row per dataset; encoders reject bad
    values before writing (B1); B2/B3 documented and pinned; kernel execution traced;
    independent Bp128 layout model; boundary and opt-in stress tests.

@@ -94,6 +94,17 @@ fn generate(spec: &str, n: usize, gl: usize) -> Vec<u16> {
                 })
                 .collect()
         }
+        "groupmax" => {
+            let w = num(1) as u32;
+            let mask = ((1u32 << w) - 1) as u16;
+            let mut rng = XorShift64(num(2));
+            (0..n)
+                .map(|i| {
+                    let r = rng.next() as u16 & mask;
+                    if i % gl == 0 { mask } else { r }
+                })
+                .collect()
+        }
         "randgroups" => {
             let seed = num(1);
             let mut rng = XorShift64(seed);
@@ -251,7 +262,7 @@ fn parse_golden(text: &str, expected_block_size: usize) -> Vec<GoldenCase> {
             bytes: optional_field("bytes").map(from_hex),
         });
     }
-    assert_eq!(cases.len(), 23, "expected 23 golden cases");
+    assert_eq!(cases.len(), 25, "expected 25 golden cases");
     // The small cases (every case of the original 21, and more) must have exact bytes.
     let exact = cases.iter().filter(|c| c.bytes.is_some()).count();
     assert!(exact >= 21, "only {exact} cases have exact bytes");
@@ -381,22 +392,42 @@ fn simdbp512_matches_parkers_avx512_build() {
     check_golden::<32>(GOLDEN_512);
 }
 
-/// The golden cases must exercise every header field of a metablock: each of the GL
-/// slots (so every header word, every 4-bit position in a word, and every lane) holds a
-/// nonzero width in some case, and nonzero fields appear in at least three metablocks.
+/// The golden cases must exercise every header field of a metablock, down to the bit:
+/// - each of the GL slots (so every header word, every 4-bit position in a word, and
+///   every lane) holds a nonzero width in some case;
+/// - each of the 4 bits of every slot's field is 1 in some case and 0 in another
+///   (width 8 = 0b1000 and width 7 = 0b0111 in every slot do this);
+/// - one case has width 8 in every slot of at least two whole metablocks, so bit 3 is
+///   set in every field of more than one metablock header, across the boundary;
+/// - nonzero fields appear in at least three metablocks.
+///
 /// This is checked from Parker's own widths (`Decompressor.offsets`), so it measures
 /// what his code was compared on, not what our code reads.
 fn check_header_coverage<const S: usize>(text: &str) {
     let gl = 16 * S;
     let mut slot_seen = vec![false; gl];
+    // bit_set[slot] / bit_clear[slot]: the bits that were 1 / 0 in that slot's field in
+    // some group (over all cases and metablocks).
+    let mut bit_set = vec![0usize; gl];
+    let mut bit_clear = vec![0usize; gl];
     let mut metablocks_seen = std::collections::BTreeSet::new();
+    let mut most_full_width8_metablocks = 0;
     for case in parse_golden(text, gl) {
         for (g, &width) in case.widths.iter().enumerate() {
+            bit_set[g % gl] |= width;
+            bit_clear[g % gl] |= !width & 0xF;
             if width > 0 {
                 slot_seen[g % gl] = true;
                 metablocks_seen.insert(g / gl);
             }
         }
+        // Metablocks of this case in which all GL slots hold width 8.
+        let full_width8 = case
+            .widths
+            .chunks(gl)
+            .filter(|mb| mb.len() == gl && mb.iter().all(|&w| w == 8))
+            .count();
+        most_full_width8_metablocks = most_full_width8_metablocks.max(full_width8);
     }
     let missing: Vec<usize> = (0..gl).filter(|&slot| !slot_seen[slot]).collect();
     assert!(
@@ -412,6 +443,17 @@ fn check_header_coverage<const S: usize>(text: &str) {
             }
         }
     }
+    let not_all_bits: Vec<usize> = (0..gl)
+        .filter(|&slot| bit_set[slot] != 0xF || bit_clear[slot] != 0xF)
+        .collect();
+    assert!(
+        not_all_bits.is_empty(),
+        "GL={gl}: slots where some header bit is never 1 or never 0: {not_all_bits:?}"
+    );
+    assert!(
+        most_full_width8_metablocks >= 2,
+        "GL={gl}: no case has width 8 in every slot of two metablocks"
+    );
     assert!(
         metablocks_seen.len() >= 3,
         "GL={gl}: nonzero widths only in metablocks {metablocks_seen:?}"
@@ -419,7 +461,7 @@ fn check_header_coverage<const S: usize>(text: &str) {
 }
 
 #[test]
-fn golden_cases_cover_every_header_field() {
+fn golden_cases_cover_every_header_bit() {
     check_header_coverage::<8>(GOLDEN_128);
     check_header_coverage::<16>(GOLDEN_256);
     check_header_coverage::<32>(GOLDEN_512);

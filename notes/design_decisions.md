@@ -71,7 +71,7 @@ Parker's guidance/data), 9 benchmarking (pending discussion with Parker).
 | S14 | Oracle = separate nightly crate with a path dependency on Parker's repo | `tools/simdbp_oracle`, run by `regenerate.sh`; not part of `cargo test` | normal tests must not need his repo, nightly, or SIMD | A | `cargo test` passes without it | call his crate from our tests | kept |
 | S15 | Golden inputs are regenerated from a spec in the test, not stored | each case stores `gen=...` and `input_fnv` | keeps the files small; the hash checks that our generated input equals the oracle's, separately from the output check | B | `check_golden` asserts the input hash before comparing outputs | store the inputs | kept |
 | S16 | Size-report index RAM is computed (8 × (G+1)), not measured | formula | the registry has no typed `GroupIndex` | B | `index_memory_is_one_usize_per_group_plus_one` checks `heap_bytes()` >= the formula | add a registry method | kept |
-| S17 | Large golden cases store a hash, not the bytes | outputs > 32 KiB: `words` (length) + `bytes_fnv` (FNV-1a 64); smaller ones: the full `bytes` too | keeps the golden files about 200 KB in total; every original case keeps exact bytes | B | all 23 cases at 128 and 21 of 23 at 256/512 have exact bytes | store everything | kept (decided in stage 5) |
+| S17 | Large golden cases store a hash, not the bytes | outputs > 32 KiB: `words` (length) + `bytes_fnv` (FNV-1a 64); smaller ones: the full `bytes` too | keeps the golden files about 250 KB in total; every original case keeps exact bytes | B | 24 of 25 cases at 128 (all but `width8_every_slot`) and 21 of 25 at 256/512 have exact bytes | store everything | kept (decided in stage 5) |
 | S18 | Test-only kernel trace | `kernel::trace` counts packs/unpacks per kernel, per thread, only under `cfg(test)` | prove which kernel executed without out-of-range tricks, at zero cost to normal builds | A | `kernel_selection_tests` | cargo feature; always-on counters | kept |
 
 ## 3. Audit findings (stage 5): behavior at the edges of the contract
@@ -86,7 +86,7 @@ Test gaps found by the audit, and how each was closed:
 
 | # | Gap | Closed by |
 |---|---|---|
-| G1 | Header word 1 never held a nonzero width in any golden file; SimdBp512 covered 21/32 lanes and 2/4 field positions; random tests had at most 6 SimdBp512 groups | new oracle cases `all_header_fields` (3 metablocks, slot s of metablock m has width (s + 3m) % 9) and `random_group_widths`, compared with Parker's bytes and widths; `golden_cases_cover_every_header_field` asserts every slot is covered, in ≥ 3 metablocks; hand-computed bytes for header word 1, lane 27 of 32, and a second-metablock header |
+| G1 | Header word 1 never held a nonzero width in any golden file; SimdBp512 covered 21/32 lanes and 2/4 field positions; random tests had at most 6 SimdBp512 groups | new oracle cases `all_header_fields` (3 metablocks, slot s of metablock m has width (s + 3m) % 9) and `random_group_widths`, compared with Parker's bytes and widths; `golden_cases_cover_every_header_bit` asserts every slot is covered, in ≥ 3 metablocks; hand-computed bytes for header word 1, lane 27 of 32, and a second-metablock header. **Follow-up (after the stage 5 review):** that only covered whole fields; bit 3 (width 8) was set in just 46/128, 82/256, 163/512 slots. New cases `width8_every_slot` (width 8 in every slot of two whole metablocks + 2 groups of a third) and `width7_every_slot` (width 7 in every slot of one metablock + 1 group of a second); the test now also asserts each of the 4 bits of every slot is 1 in some case and 0 in another, and that width 8 fills every slot of ≥ 2 metablocks of one case |
 | G2 | Nothing proved the SIMD kernels executed (only `Kernel::best` + a one-time objdump); a CPU without AVX-512 silently tested scalar only | test-only trace (S18); `SKIPPED` lines; `CODECS_REQUIRE_SIMD=1` makes missing SIMD a failure; a deliberately broken AVX-512 kernel made the tests fail (section 6) |
 | G3 | Bp128 bytes pinned for one width-1 case only | independent layout model, widths 0..=8, partial chunks, every value at both ends of each lane |
 | G4 | No regression test for the P1 sequence | `reused_index_never_returns_the_previous_rows_group` (all random-access codecs) |
@@ -100,25 +100,34 @@ Test gaps found by the audit, and how each was closed:
 ### Confirmed against output of his code
 
 (Golden vectors from his own `compress`, `Decompressor`, and `transcode`, built three
-times: `sse` = BLOCK_SIZE 128, `avx2` = 256, `avx512` = 512; 23 cases each.)
+times: `sse` = BLOCK_SIZE 128, `avx2` = 256, `avx512` = 512; 25 cases each.)
 
 - Our bytes are **identical** to his `compress` output, viewed as little-endian bytes,
   with the scalar kernel and with the SIMD kernel. Exact byte comparison for every case
-  up to 32 KiB of output (all 23 at 128; 21 at 256 and 512); for the two largest
-  cases at 256 and 512 (`all_header_fields`, 132,359 / 526,855 values;
-  `random_group_widths`, 66,305 / 263,681 values) the same length and FNV-1a 64 hash.
+  up to 32 KiB of output (24 of 25 at 128; 21 of 25 at 256 and 512); for the larger
+  cases (`all_header_fields`, 132,359 / 526,855 values at 256 / 512;
+  `random_group_widths`, 66,305 / 263,681 values; `width8_every_slot`, 32,897 /
+  131,329 / 524,801 values at 128 / 256 / 512; `width7_every_slot`, 65,537 / 262,145
+  values) the same length and FNV-1a 64 hash of the whole output (headers included).
   Cases: n = 1 (0 and 255), one full group at every width 0..=8, partial groups (GL/2+3,
   GL−1, GL+1), exact multiples (3 groups), all 255, 20 groups with widths 0..=8 cycling,
   an invented block-max-like mix, exactly one full metablock (GL²), a second metablock
   (GL² + 2·GL + 9), a third metablock holding one 1-value group (2·GL² + 1), every header
-  slot nonzero across three metablocks (2·GL² + 5·GL + 7), and random per-group widths
-  across a metablock boundary (GL² + 3·GL + 1).
+  slot nonzero across three metablocks (2·GL² + 5·GL + 7), random per-group widths
+  across a metablock boundary (GL² + 3·GL + 1), width 8 in every group (2·GL² + GL + 1:
+  two whole metablocks and 2 groups of a third), and width 7 in every group (GL² + 1).
 - Our generated inputs equal the oracle's inputs (`input_fnv`, checked before outputs).
 - Our decoder reads his bytes back to the original values, consuming exactly all of them.
 - Our per-group widths equal his `Decompressor.offsets`, and our `GroupIndex` byte starts
-  equal his `accumulated_offsets × 2 × STRIDE`, for every group of every case; together
-  the cases put a nonzero width in every header slot (all 4 header words, all 4 field
-  positions, all lanes) of at least three metablocks, at all three sizes.
+  equal his `accumulated_offsets × 2 × STRIDE`, for every group of every case. At all
+  three sizes, together the cases (checked by `golden_cases_cover_every_header_bit`):
+  put a nonzero width in every header slot (all 4 header words, all 4 field positions,
+  all lanes); make each of the 4 bits of every slot's field 1 in some case and 0 in
+  another (width 8 = 0b1000 and width 7 = 0b0111 fill every slot); put width 8 in every
+  slot of two whole metablocks of one case (so across a metablock boundary); and have
+  nonzero widths in at least three metablocks. Not checked: every bit of every slot
+  separately in *each* metablock (the bit check combines all metablocks; only width 8
+  is required to fill whole metablocks).
 - His scalar `transcode` to the other two group sizes gives the same bytes (length and
   FNV-1a hash) as our encoder for those sizes. (Same author as `compress`, so this is a
   second piece of his code, not a fully independent implementation.)

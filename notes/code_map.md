@@ -418,13 +418,15 @@ re-decoding itself); BitPacker4x's 4-lane layout instead of SIMDBP's STRIDE lane
   checked), so the 2-byte-aligned stack buffers are valid inputs.
 - **Verified against Parker's code**: `tools/simdbp_oracle` (separate nightly crate,
   path dependency on his repo, read-only) built 3 times (sse / avx2 / avx512) writes
-  `tests/data/simdbp/simdbp{128,256,512}.txt`: 23 cases each with his `compress` output
+  `tests/data/simdbp/simdbp{128,256,512}.txt`: 25 cases each with his `compress` output
   (full bytes when <= 32 KiB, otherwise length + FNV-1a hash), his `Decompressor` widths
   and offsets, and hashes of his scalar `transcode` to the other sizes. `tests/simdbp.rs`
   requires our bytes to be identical (scalar and SIMD kernels), our widths/offsets to
   equal his, and our other-size encodings to equal his transcodes; it also checks that
   the cases put a nonzero width in every header slot (every word, 4-bit position, and
-  lane) across at least three metablocks. See `notes/design_decisions.md` for what this
+  lane), make each of the 4 bits of every slot's field both 1 and 0 in some case (width
+  8 and width 7 in every slot), put width 8 in every slot of two whole metablocks, and
+  have nonzero widths in at least three metablocks. See `notes/design_decisions.md` for what this
   does and doesn't prove, and for the issues the oracle reproduced in his code (stale
   `Decompressor` cache, AVX2 width-6 bug).
 - **Which kernel ran** is recorded by a test-only counter (`kernel::trace`, compiled only
