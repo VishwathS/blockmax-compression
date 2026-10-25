@@ -216,7 +216,69 @@ A drop-in replacement for the SIMDBP variant would need:
 
 The current `BlockCodec` trait (u16 values <= 255, encode/decode a whole block, no
 cursor, no random access) covers only items 1, 3 and 5. Items 4 and 6 are what the
-later random-access stage needs to add.
+later random-access stage needs to add. `Bp128` (section (c)) also covers item 9: an
+all-zero 128-value chunk costs one width byte and no data.
+
+## (c) Codecs in this crate (`~/codecs`) and their status
+
+| codec | file | status | bytes per value (synthetic, from `size_report`) |
+|---|---|---|---|
+| `Raw` | `src/raw.rs` | done | always 1.000 |
+| `VByte` | `src/vbyte.rs` | done | 1 for 0..=127, 2 for 128..=255 |
+| `Bp128` | `src/bp128.rs` | done | 16 × width + 1 bytes per 128 values |
+| SIMDBP port | (not started) | stage 6 | |
+
+Size report, 1M values per dataset (`cargo run --release --example size_report`):
+
+| dataset | Raw | VByte | Bp128 |
+|---|---|---|---|
+| uniform 0..=255 | 1.000 | 1.500 | 1.008 |
+| uniform 0..=15 (4-bit) | 1.000 | 1.000 | 0.508 |
+| all zeros | 1.000 | 1.000 | 0.008 |
+| block-max-like (90% zero, 9% 1..=20, 1% 21..=255) | 1.000 | 1.006 | 0.865 |
+
+### `Bp128` format and how it compares to SIMDBP
+
+```
+[ w0 | w1 | ... | w(G-1) ][ chunk 0 data ][ chunk 1 data ] ... [ chunk G-1 data ]
+  1 byte per chunk          16 × w0 bytes   16 × w1 bytes
+```
+- G = `ceil(n / 128)`. `n` is not stored (comes from `out.len()`), same as SIMDBP.
+- Packing: `bitpacking::BitPacker4x` (4 interleaved lanes, SSE3 in release builds,
+  a scalar fallback in debug builds; both write the same bytes). u16 values are widened
+  to u32 for the crate and narrowed back after decoding.
+- Similarities to SIMDBP: per-group max bit width, all headers before all data, width 0
+  costs no data, last group zero-padded.
+- Differences: groups are 128 (SIMDBP on AVX-512: 512); a width takes a whole byte
+  (SIMDBP: 4 bits, packed with `pack_4`); no metablocks; the data layout is the crate's
+  4-lane interleave, not SIMDBP's STRIDE-lane layout.
+- Random access (not implemented yet): chunk k's data starts at
+  `G + 16 × (w0 + ... + w(k-1))`. Like SIMDBP's `Decompressor::init`, a reader would
+  build that prefix sum once per term, then unpack one 128-value chunk in O(1). The
+  current trait can't express this, so it needs the trait discussion first (items 4
+  and 6 in section (a)).
+
+### Design decisions and limitations
+- **Range check in every build.** All three `encode`s now `assert!` (not
+  `debug_assert!`) that values are <= 255. Before, a release build silently truncated
+  in `Raw` (256 → 0) and wrote 3-byte values in `VByte` that `decode` rejected.
+- **Padding cost.** A short last chunk is padded to 128 values, which costs up to
+  127 × width bits. That cost is negligible for long inputs encoded in 128-value pieces,
+  but large if a caller encodes many tiny inputs. An alternative is to store the tail
+  differently (raw bytes, VByte, or a scalar packer for exactly the leftover values).
+- **One width byte per chunk.** Widths are 0..=8, so 4 bits would be enough (as in
+  SIMDBP). That saves 0.004 B/value, which matters only for nearly all-zero data
+  (all zeros: 0.008 → 0.004).
+- **Outliers dominate.** On block-max-like data Bp128 gets only 0.865 B/value even though
+  90% of values are 0: with 1% outliers, about 1 − 0.99^128 ≈ 72% of chunks contain at
+  least one value >= 21 and are packed at up to 8 bits. Ideas to test on real data:
+  smaller chunks (BitPacker1x, 32 values), PFor-style exceptions, or storing the
+  outliers separately. Real block maxes may differ from this synthetic mix, so check on
+  `export_data` output (stage 5) before optimizing.
+
+### Next stages (see `CLAUDE.md`)
+4. Codec registry, 5. real index loader (`export_data` matrices), 6. SIMDBP integration,
+7. CLI, 8. benchmarking (criterion speed + bytes per value on real data).
 
 ## (b) Questions to verify yourself (not answered here)
 

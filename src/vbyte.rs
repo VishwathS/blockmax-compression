@@ -29,7 +29,9 @@ impl BlockCodec for VByte {
 
     fn encode(input: &[u16], out: &mut Vec<u8>) {
         for &value in input {
-            debug_assert!(
+            // `assert!` (not `debug_assert!`) so release builds check too. Without it,
+            // a value like 20000 would encode as 3 bytes that `decode` then rejects.
+            assert!(
                 value <= MAX_VALUE,
                 "VByte: value {value} is above {MAX_VALUE}"
             );

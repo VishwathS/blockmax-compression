@@ -9,10 +9,12 @@
 //! max by a query weight without overflowing. Using `u16` here too means a codec can be
 //! dropped into that code without converting.
 
+pub mod bp128;
 pub mod raw;
 pub mod vbyte;
 
 // Re-export the codec types so users can write `codecs::Raw` instead of `codecs::raw::Raw`.
+pub use bp128::Bp128;
 pub use raw::Raw;
 pub use vbyte::VByte;
 
@@ -24,8 +26,9 @@ pub const MAX_VALUE: u16 = 255;
 /// # Contract
 ///
 /// - Every input value is a `u16` that is **at most [`MAX_VALUE`] (255)**. `encode`
-///   checks this with `debug_assert!`, so a debug build (including `cargo test`) panics
-///   on a bad value. A release build skips the check, and the output is then unspecified.
+///   checks this with `assert!` and panics on a bad value, in debug **and** release
+///   builds. (Encoding happens once, offline, so the check costs nothing at query time,
+///   and a release build never silently writes a wrong value.)
 /// - `encode(input, out)` appends the encoded bytes to `out`.
 /// - `decode(input, out)` fills `out` and returns how many bytes it consumed.
 ///
@@ -34,14 +37,18 @@ pub const MAX_VALUE: u16 = 255;
 pub trait BlockCodec {
     /// How many values the codec prefers to handle per call.
     ///
-    /// `Raw` and `VByte` work on any length, so for them this is only a suggestion
-    /// to callers that split long inputs into blocks.
+    /// Every codec accepts any input length, so this is only a suggestion to callers
+    /// that split long inputs into blocks. For `Bp128` it matters for size: it packs
+    /// 128 values at a time and zero-pads a shorter last chunk, so encoding in
+    /// multiples of 128 avoids storing padding.
     const BLOCK_SIZE: usize;
 
     /// Encodes `input` and **appends** the bytes to `out`. Bytes that are already in
     /// `out` are left alone, so several blocks can be written into one buffer.
     ///
-    /// Every value in `input` must be `<= MAX_VALUE` (checked in debug builds only).
+    /// # Panics
+    ///
+    /// Panics if any value in `input` is above `MAX_VALUE` (in every build).
     fn encode(input: &[u16], out: &mut Vec<u8>);
 
     /// Decodes exactly `out.len()` values from the start of `input` into `out`.

@@ -2,7 +2,7 @@
 //!
 //! Every generated value is in 0..=255, the range the `BlockCodec` contract allows.
 
-use codecs::{BlockCodec, MAX_VALUE, Raw, VByte};
+use codecs::{BlockCodec, Bp128, MAX_VALUE, Raw, VByte};
 use proptest::prelude::*;
 
 /// Encodes `input` with codec `C`, decodes it again, and checks that we get the same
@@ -32,10 +32,14 @@ fn fixed_cases() -> Vec<(&'static str, Vec<u16>)> {
 
     vec![
         ("empty", vec![]),
+        ("one value", vec![7]),
+        ("128 zeros (one full Bp128 chunk)", vec![0; 128]),
         ("130 zeros", vec![0; 130]),
         ("5 x 255", vec![MAX_VALUE; 5]),
         ("127 threes then 200", threes_then_200),
         ("0..=255", (0..=MAX_VALUE).collect()),
+        // 300 = 2 full chunks + 44 leftover, with small values (2-bit width).
+        ("300 values in 0..=3", (0..300).map(|i| i % 4).collect()),
     ]
 }
 
@@ -52,6 +56,14 @@ fn vbyte_roundtrips_fixed_cases() {
     for (name, input) in fixed_cases() {
         println!("VByte: {name}");
         roundtrip::<VByte>(&input);
+    }
+}
+
+#[test]
+fn bp128_roundtrips_fixed_cases() {
+    for (name, input) in fixed_cases() {
+        println!("Bp128: {name}");
+        roundtrip::<Bp128>(&input);
     }
 }
 
@@ -80,6 +92,39 @@ fn blocks_can_be_decoded_back_to_back() {
     let input: Vec<u16> = (0..1000u32).map(|i| (i * i % 256) as u16).collect();
     roundtrip_in_blocks::<Raw>(&input);
     roundtrip_in_blocks::<VByte>(&input);
+    roundtrip_in_blocks::<Bp128>(&input);
+}
+
+/// Like `roundtrip_in_blocks`, but the pieces have different, arbitrary lengths
+/// (not multiples of BLOCK_SIZE). Each `encode` call appends its own self-contained
+/// section, and each `decode` must stop exactly at the end of its section.
+fn roundtrip_concatenated<C: BlockCodec>(pieces: &[Vec<u16>]) {
+    let mut encoded = Vec::new();
+    for piece in pieces {
+        C::encode(piece, &mut encoded);
+    }
+
+    let mut pos = 0;
+    for piece in pieces {
+        let mut decoded = vec![0u16; piece.len()];
+        pos += C::decode(&encoded[pos..], &mut decoded);
+        assert_eq!(&decoded, piece);
+    }
+    assert_eq!(pos, encoded.len(), "decoders should consume every byte");
+}
+
+#[test]
+fn concatenated_encodes_decode_in_order() {
+    let pieces = vec![
+        vec![MAX_VALUE; 128],               // full chunk, width 8
+        vec![1, 2, 3, 4, 5],                // partial chunk, width 3
+        vec![],                             // empty: writes nothing
+        vec![0; 200],                       // all zeros over 2 chunks
+        (0..300).map(|i| i % 17).collect(), // 2 full chunks + 44, width 5
+    ];
+    roundtrip_concatenated::<Raw>(&pieces);
+    roundtrip_concatenated::<VByte>(&pieces);
+    roundtrip_concatenated::<Bp128>(&pieces);
 }
 
 // ---------- exact-byte tests ----------
@@ -140,20 +185,134 @@ fn vbyte_panics_on_three_byte_value() {
     VByte::decode(&[0x00, 0x00, 0x81], &mut out);
 }
 
-// The `debug_assert!` in `encode` only exists in debug builds, so these tests are
-// compiled only when debug assertions are on (the default for `cargo test`).
-#[cfg(debug_assertions)]
+// ---------- Bp128 format tests ----------
+
+/// Returns Bp128's encoding of `input`.
+fn bp128_bytes(input: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    Bp128::encode(input, &mut out);
+    out
+}
+
+#[test]
+fn bp128_empty_input_writes_nothing() {
+    assert!(bp128_bytes(&[]).is_empty());
+}
+
+#[test]
+fn bp128_all_zero_chunk_is_one_byte() {
+    // Width 0: only the width byte is stored, no data.
+    assert_eq!(bp128_bytes(&[0; 128]), [0]);
+    // Two chunks (128 + 72), both zero: two width bytes.
+    assert_eq!(bp128_bytes(&[0; 200]), [0, 0]);
+}
+
+#[test]
+fn bp128_small_values_use_small_widths() {
+    // Max 1 → width 1 → 1 width byte + 128 × 1 / 8 = 16 data bytes.
+    let ones: Vec<u16> = (0..128).map(|i| i % 2).collect();
+    let bytes = bp128_bytes(&ones);
+    assert_eq!(bytes[0], 1, "width byte");
+    assert_eq!(bytes.len(), 1 + 16);
+
+    // Max 15 (a 4-bit quantized max) → width 4 → 1 + 64 bytes.
+    let nibbles: Vec<u16> = (0..128).map(|i| i % 16).collect();
+    let bytes = bp128_bytes(&nibbles);
+    assert_eq!(bytes[0], 4);
+    assert_eq!(bytes.len(), 1 + 64);
+}
+
+#[test]
+fn bp128_full_range_uses_8_bits() {
+    // One 255 forces the whole chunk to width 8: 1 + 128 bytes, slightly more than Raw.
+    let mut input = vec![0u16; 128];
+    input[77] = MAX_VALUE;
+    let bytes = bp128_bytes(&input);
+    assert_eq!(bytes[0], 8);
+    assert_eq!(bytes.len(), 1 + 128);
+}
+
+#[test]
+fn bp128_partial_chunk_is_padded_to_128() {
+    // 5 values with max 5 → width 3. The chunk is padded to 128 values, so the data
+    // is still 128 × 3 / 8 = 48 bytes.
+    let bytes = bp128_bytes(&[1, 2, 3, 4, 5]);
+    assert_eq!(bytes[0], 3);
+    assert_eq!(bytes.len(), 1 + 48);
+
+    // 129 values = one full chunk (width 1) + one chunk with a single value (width 2).
+    // All width bytes come first: [1, 2], then 16 bytes, then 32 bytes.
+    let mut input = vec![1u16; 128];
+    input.push(2);
+    let bytes = bp128_bytes(&input);
+    assert_eq!(&bytes[..2], [1, 2]);
+    assert_eq!(bytes.len(), 2 + 16 + 32);
+}
+
+#[test]
+fn bp128_known_bytes() {
+    // Pins the exact bytes so a change in the `bitpacking` crate's layout would be
+    // caught. It also checks that debug builds (which use the crate's plain scalar
+    // packer) and release builds (its SIMD packer) agree: run `cargo test --release`.
+    // BitPacker4x puts value i in lane i % 4 at bit i / 4, and writes lane j's bits
+    // as the little-endian u32 at bytes 4j..4j+4 (for width 1).
+    // Value 0 → lane 0, bit 0 → byte 4 × 0 = 0 gets 0b01.
+    // Value 5 → lane 1, bit 1 → byte 4 × 1 = 4 gets 0b10.
+    let mut input = vec![0u16; 128];
+    input[0] = 1;
+    input[5] = 1;
+    let mut expected = vec![0u8; 1 + 16];
+    expected[0] = 1; // width byte
+    expected[1] = 0b01; // data byte 0
+    expected[1 + 4] = 0b10; // data byte 4
+    assert_eq!(bp128_bytes(&input), expected);
+}
+
+#[test]
+#[should_panic(expected = "input ended in the middle of a chunk")]
+fn bp128_panics_on_truncated_input() {
+    let mut bytes = bp128_bytes(&[MAX_VALUE; 128]);
+    bytes.pop(); // drop the last data byte
+    Bp128::decode(&bytes, &mut [0u16; 128]);
+}
+
+#[test]
+#[should_panic(expected = "width bytes")]
+fn bp128_panics_on_missing_width_bytes() {
+    // 129 values need 2 width bytes, but the input has only 1.
+    Bp128::decode(&[0], &mut [0u16; 129]);
+}
+
+#[test]
+#[should_panic(expected = "invalid bit width 9")]
+fn bp128_panics_on_invalid_width() {
+    // No value <= 255 needs 9 bits, so `encode` never writes this width byte.
+    Bp128::decode(&[9; 200], &mut [0u16; 128]);
+}
+
+// ---------- range check (values above 255) ----------
+// `encode` uses `assert!`, not `debug_assert!`, so these must pass in both
+// `cargo test` and `cargo test --release`.
+
 #[test]
 #[should_panic(expected = "above 255")]
-fn raw_rejects_values_above_255_in_debug() {
+fn raw_rejects_values_above_255() {
     Raw::encode(&[256], &mut Vec::new());
 }
 
-#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "above 255")]
-fn vbyte_rejects_values_above_255_in_debug() {
+fn vbyte_rejects_values_above_255() {
     VByte::encode(&[256], &mut Vec::new());
+}
+
+#[test]
+#[should_panic(expected = "above 255")]
+fn bp128_rejects_values_above_255() {
+    // The bad value sits in the second chunk, after a valid first chunk.
+    let mut input = vec![0u16; 200];
+    input[150] = 256;
+    Bp128::encode(&input, &mut Vec::new());
 }
 
 // ---------- property tests ----------
@@ -175,5 +334,22 @@ proptest! {
     #[test]
     fn vbyte_roundtrips_random(input in block()) {
         roundtrip::<VByte>(&input);
+    }
+
+    #[test]
+    fn bp128_roundtrips_random(input in block()) {
+        roundtrip::<Bp128>(&input);
+    }
+
+    /// Small values (like 4-bit quantized maxes) with a random max width, so Bp128
+    /// gets tested at every width from 0 to 8, not mostly at width 8.
+    #[test]
+    fn bp128_roundtrips_random_widths(
+        input in (0u32..=8).prop_flat_map(|bits| {
+            let max = ((1u32 << bits) - 1) as u16; // largest value with `bits` bits
+            prop::collection::vec(0u16..=max, 0..1000)
+        })
+    ) {
+        roundtrip::<Bp128>(&input);
     }
 }

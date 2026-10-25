@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo run --release --example size_report`
 
-use codecs::{BlockCodec, MAX_VALUE, Raw, VByte};
+use codecs::{BlockCodec, Bp128, MAX_VALUE, Raw, VByte};
 
 /// Values per dataset. Large enough that per-block effects (like a partial last
 /// block) don't affect the averages.
@@ -80,8 +80,8 @@ fn main() {
     ];
 
     println!(
-        "{:<24} {:>9} {:>7} {:>7} {:>7} {:>7}",
-        "dataset", "n", "mean", "zeros", "Raw", "VByte"
+        "{:<24} {:>9} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "dataset", "n", "mean", "zeros", "Raw", "VByte", "Bp128"
     );
     for (name, values) in &datasets {
         let n = values.len();
@@ -90,10 +90,11 @@ fn main() {
         let zeros = values.iter().filter(|&&v| v == 0).count() as f64 / n as f64;
         let raw = encoded_size::<Raw>(values) as f64 / n as f64;
         let vbyte = encoded_size::<VByte>(values) as f64 / n as f64;
+        let bp128 = encoded_size::<Bp128>(values) as f64 / n as f64;
         println!(
-            "{name:<24} {n:>9} {mean:>7.2} {:>6.1}% {raw:>7.3} {vbyte:>7.3}",
+            "{name:<24} {n:>9} {mean:>7.2} {:>6.1}% {raw:>7.3} {vbyte:>7.3} {bp128:>7.3}",
             zeros * 100.0
         );
     }
-    println!("(Raw / VByte columns are bytes per value)");
+    println!("(Raw / VByte / Bp128 columns are bytes per value)");
 }

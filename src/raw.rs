@@ -16,7 +16,9 @@ impl BlockCodec for Raw {
         // We know the exact output size, so grow the buffer once up front.
         out.reserve(input.len());
         for &value in input {
-            debug_assert!(
+            // `assert!` (not `debug_assert!`) so release builds check too. Without it,
+            // `as u8` below would silently turn 256 into 0.
+            assert!(
                 value <= MAX_VALUE,
                 "Raw: value {value} is above {MAX_VALUE}"
             );
