@@ -214,19 +214,21 @@ A drop-in replacement for the SIMDBP variant would need:
     `2^b − 1` without decoding, which might let the search skip groups. This is a design
     idea, not something the current code does.
 
-The current `BlockCodec` trait (u16 values <= 255, encode/decode a whole block, no
-cursor, no random access) covers only items 1, 3 and 5. Items 4 and 6 are what the
-later random-access stage needs to add. `Bp128` (section (c)) also covers item 9: an
-all-zero 128-value chunk costs one width byte and no data.
+The `BlockCodec` trait (u16 values <= 255, encode/decode a whole block, no cursor)
+covers items 1, 3 and 5. The separate `RandomAccessCodec` trait + `GroupIndex`
+(section (c), "Random access") cover item 4 (a per-row index built once into reusable
+memory) and item 6 at group granularity (128 values; the caller slices out the 16/32/64
+it needs, like `idx % BLOCK_SIZE` today). `Bp128` also covers item 9: an all-zero
+128-value chunk costs one width byte and no data. Items 7, 8 and 10 are still open.
 
 ## (c) Codecs in this crate (`~/codecs`) and their status
 
-| codec | file | status | bytes per value (synthetic, from `size_report`) |
-|---|---|---|---|
-| `Raw` | `src/raw.rs` | done | always 1.000 |
-| `VByte` | `src/vbyte.rs` | done | 1 for 0..=127, 2 for 128..=255 |
-| `Bp128` | `src/bp128.rs` | done | 16 × width + 1 bytes per 128 values |
-| SIMDBP port | (not started) | stage 6 | |
+| codec | file | status | bytes per value (synthetic, from `size_report`) | random access |
+|---|---|---|---|---|
+| `Raw` | `src/raw.rs` | done | always 1.000 | yes, 128-value groups, O(1) locate |
+| `VByte` | `src/vbyte.rs` | done | 1 for 0..=127, 2 for 128..=255 | no |
+| `Bp128` | `src/bp128.rs` | done | 16 × width + 1 bytes per 128 values | yes, 128-value groups, O(g) one-shot / O(1) with `GroupIndex` |
+| SIMDBP port | (not started) | stage 6 | | (its own format supports it) |
 
 All three are registered in `codecs::Codec` (`src/registry.rs`, see below).
 
@@ -254,11 +256,8 @@ Size report, 1M values per dataset (`cargo run --release --example size_report`)
 - Differences: groups are 128 (SIMDBP on AVX-512: 512); a width takes a whole byte
   (SIMDBP: 4 bits, packed with `pack_4`); no metablocks; the data layout is the crate's
   4-lane interleave, not SIMDBP's STRIDE-lane layout.
-- Random access (not implemented yet): chunk k's data starts at
-  `G + 16 × (w0 + ... + w(k-1))`. Like SIMDBP's `Decompressor::init`, a reader would
-  build that prefix sum once per term, then unpack one 128-value chunk in O(1). The
-  current trait can't express this, so it needs the trait discussion first (items 4
-  and 6 in section (a)).
+- Random access: chunk k's data starts at `G + 16 × (w0 + ... + w(k-1))`. Implemented
+  in the "Random access" subsection below, without changing this format.
 
 ### Design decisions and limitations
 - **Range check in every build.** All three `encode`s now `assert!` (not
@@ -298,14 +297,81 @@ Open questions for later stages:
   or a PFor exception threshold) is a separate type today, so it would be a separate
   variant. If there end up being many such settings, a variant could carry them
   (`Codec::Bp { chunk: usize }`); not needed yet.
-- **SIMDBP may not fit the trait as is.** It's built for random access to one group,
-  and its group size depends on the SIMD width (512 on this machine). Stage 6 may need
-  the random-access trait discussion first.
+- **SIMDBP and the random-access trait.** SIMDBP's group size depends on the SIMD
+  width (512 on this machine) and its widths are 4-bit values in metablock headers.
+  `RandomAccessCodec` allows any `GROUP_LEN` and any metadata, so a port should fit:
+  `locate_groups` = unpack the headers + prefix sum (what `init` does). Its storage is
+  `Vec<u16>`, not bytes, so stage 6 has to decide how to view it as `&[u8]`.
+
+### Random access (`src/random_access.rs`)
+
+**What Parker's SIMDBP does** (re-checked in `compress_simdbp.rs` / `live_block.rs`):
+- A group is located with `Decompressor::accumulated_offsets`, a prefix sum of the group
+  widths built by `init` (O(G) per term per query: unpack every 4-bit header with
+  `unpack_4`, then sum). Nothing beyond the 4-bit headers is stored; the offset table
+  is rebuilt in RAM from the headers. After `init`, `decompress_block` finds a group in
+  O(1) (`offset × STRIDE`, length `STRIDE × width`).
+- Each access decodes the **whole** group (512 values on AVX-512) into a cached buffer;
+  the caller indexes it with `idx % BLOCK_SIZE`. The query path asks for individual
+  positions (`filter_idx`) but always gets whole groups back. The register-sized
+  `decompress_register` (16 values) exists only for AVX2 and is never called.
+- The partial last group is zero-padded to `BLOCK_SIZE` when encoding; `n` is passed to
+  `Decompressor::new(n)`, and callers stop at `vector_len` (`live_block.rs:150-154,
+  1325-1336`).
+
+**Our design.** A separate trait, `RandomAccessCodec: BlockCodec`, so `BlockCodec` and
+every byte format stay unchanged and codecs that can't seek (VByte) just don't
+implement it. Stateless, like `BlockCodec`: every call takes the row and `n`.
+- `group_range(input, n, g)`: byte range of group g's data, from metadata only.
+- `decode_group_bytes(data, out)`: decode one group from those bytes.
+- `decode_group(input, n, g, out) -> usize` (provided): one-shot locate + decode,
+  writes the group's values to `out[..len]` and returns `len` (`< GROUP_LEN` only for
+  the partial last group). A reusable `[u16; GROUP_LEN]` buffer works for every call,
+  so the hot path allocates nothing.
+- `locate_groups(input, n, &mut Vec<usize>)`: all G+1 group starts in one pass.
+- `GroupIndex<C>`: wraps that `Vec`. `build` once per row (O(G)), then
+  `decode_group(input, g, out)` locates in O(1). Same split as SIMDBP's
+  `init` / `decompress_block`. Rebuilding for another row reuses the allocation.
+- Errors: invalid group index → panic "out of range"; `out` too short → "room for";
+  truncated or invalid row → "width bytes" / "input ended" / "describe" /
+  "invalid bit width". `GroupIndex::build` checks the whole row against `input.len()`
+  once, so later O(1) lookups can't run past the buffer.
+
+**Cost per codec.**
+
+| codec | locate, one-shot | locate, `GroupIndex` | decode a located group |
+|---|---|---|---|
+| `Raw` | O(1): bytes `128g .. 128g + len` | O(1) (index not needed) | copy `len` bytes |
+| `Bp128` | **O(g)**: sum of the g width bytes before it | O(G) build, then O(1) | unpack 128 values, copy `len` |
+
+Bp128 one-shot is not O(1): decoding every group that way costs O(G²) in total, so use
+a `GroupIndex` for more than a few lookups per row.
+
+**Metadata overhead.**
+- Stored (on disk / in the encoded row): unchanged. Bp128 already stored 1 width byte
+  per 128 values (0.0078 B/value), which the size report has always counted. Raw stores
+  none.
+- In RAM while a row is open: `GroupIndex` = 8 bytes × (G+1) ≈ 0.0625 B/value with
+  128-value groups. For the running example, level 1 (1,105,228 values): G = 8,635, so
+  ≈ 69 KB per open term, vs ≈ 22 KB for SIMDBP's `Decompressor` (2,159 groups of 512:
+  `accumulated_offsets` 17 KB + `offsets` 5 KB). Level 0 (69,077 values): ≈ 4.3 KB.
+  Storing `u32` offsets would halve this; not done yet (rows fit easily in u32, but
+  `usize` keeps the code simple until benchmarks say it matters).
+
+**Differences from SIMDBP.** 128-value groups instead of 512; 1-byte widths instead of
+4-bit packed metablock headers; no metablocks; `GroupIndex` stores byte offsets (the
+width is recovered as `len / 16`) instead of widths + a prefix sum in STRIDE units; no
+cached current group inside the index (the caller owns the output buffer and can skip
+re-decoding itself); BitPacker4x's 4-lane layout instead of SIMDBP's STRIDE lanes.
+
+**Size report.** Unchanged byte for byte (no format changed).
 
 ### Next stages (see `CLAUDE.md`)
-Done: 4. codec registry. Next: 5. real index loader (`export_data` matrices),
-6. SIMDBP integration, 7. CLI, 8. benchmarking (criterion speed + bytes per value on
-real data).
+Done: 4. codec registry, random access (`RandomAccessCodec` + `GroupIndex` for Raw and
+Bp128). Next: 5. real index loader (`export_data` matrices), 6. SIMDBP integration
+(as a `RandomAccessCodec`), 7. CLI, 8. benchmarking (criterion speed + bytes per value
+on real data; include one-shot vs. `GroupIndex` lookup, and `GroupIndex` build cost
+per term).
 
 ## (b) Questions to verify yourself (not answered here)
 

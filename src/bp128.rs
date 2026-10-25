@@ -15,9 +15,10 @@
 //! - G = `ceil(n / 128)` chunks, where n is the number of values. n itself is not
 //!   stored: the decoder gets it from `out.len()`, like every codec in this crate.
 //! - **All width bytes come first**, before any data. This mirrors Parker's SIMDBP
-//!   (headers first) and is meant for random access later: chunk k's data starts at
-//!   byte `G + 16 × (w0 + ... + w(k-1))`, which can be computed from the width bytes
-//!   alone without touching any packed data.
+//!   (headers first) and is what makes random access work (see the
+//!   [`RandomAccessCodec`] impl below): chunk k's data starts at byte
+//!   `G + 16 × (w0 + ... + w(k-1))`, which can be computed from the width bytes alone
+//!   without touching any packed data.
 //! - A chunk of width 0 (all zeros) has **no data bytes**, only its width byte.
 //! - The last chunk, if shorter than 128, is padded with zeros to 128 values and packed
 //!   like the others. Zeros never raise the max, so padding doesn't change the width,
@@ -29,9 +30,11 @@
 //! lane i % 4) so SIMD instructions can pack 4 values at once. We only rely on the
 //! crate to unpack what it packed, so the exact layout doesn't matter to this code.
 
+use std::ops::Range;
+
 use bitpacking::{BitPacker, BitPacker4x};
 
-use crate::{BlockCodec, MAX_VALUE};
+use crate::{BlockCodec, MAX_VALUE, RandomAccessCodec};
 
 /// Values per chunk. `BitPacker4x` always packs exactly this many (128).
 const CHUNK_LEN: usize = BitPacker4x::BLOCK_LEN;
@@ -103,21 +106,126 @@ impl BlockCodec for Bp128 {
         let mut pos = n_chunks; // byte offset of the next chunk's data
         let mut unpacked = [0u32; CHUNK_LEN];
         for (chunk_out, &width) in out.chunks_mut(CHUNK_LEN).zip(widths) {
-            assert!(width <= MAX_BITS, "Bp128: invalid bit width {width}");
-            let n_bytes = BitPacker4x::compressed_block_size(width); // 16 × width
+            let n_bytes = chunk_bytes(width); // 16 × width, after checking width <= 8
             let data = input
                 .get(pos..pos + n_bytes)
                 .expect("Bp128: input ended in the middle of a chunk");
-            // Always unpacks a full 128 values, including any zero padding.
-            packer.decompress(data, &mut unpacked, width);
-            // Copy back only as many values as this chunk has (fewer than 128 for a
-            // partial last chunk). `zip` stops at the shorter of the two.
-            for (value, &wide) in chunk_out.iter_mut().zip(&unpacked) {
-                // width <= 8, so every unpacked value is <= 255 and fits in a u16.
-                *value = wide as u16;
-            }
+            unpack_chunk(&packer, data, width, &mut unpacked, chunk_out);
             pos += n_bytes;
         }
         pos
     }
+}
+
+/// Size in bytes of one chunk's packed data at `width` bits: 16 × width (128 values ×
+/// width bits / 8). Panics on a width above 8, which `encode` never writes.
+fn chunk_bytes(width: u8) -> usize {
+    assert!(width <= MAX_BITS, "Bp128: invalid bit width {width}");
+    BitPacker4x::compressed_block_size(width)
+}
+
+/// Unpacks one chunk (`data`, packed at `width` bits) and writes its first `out.len()`
+/// values to `out`. `scratch` is a reusable buffer for the full 128 unpacked values.
+fn unpack_chunk(
+    packer: &BitPacker4x,
+    data: &[u8],
+    width: u8,
+    scratch: &mut [u32; CHUNK_LEN],
+    out: &mut [u16],
+) {
+    // Always unpacks a full 128 values, including any zero padding.
+    packer.decompress(data, scratch, width);
+    // Copy back only as many values as this chunk has (fewer than 128 for a partial
+    // last chunk). `zip` stops at the shorter of the two.
+    for (value, &wide) in out.iter_mut().zip(scratch.iter()) {
+        // width <= 8, so every unpacked value is <= 255 and fits in a u16.
+        *value = wide as u16;
+    }
+}
+
+/// Random access, one 128-value chunk at a time. A **group** here is exactly one chunk,
+/// so the byte format is the same as for sequential `decode`; nothing extra is stored.
+///
+/// Finding chunk k needs the sum of the k width bytes before it, because chunk sizes
+/// vary (16 × width bytes):
+///
+/// - [`group_range`](RandomAccessCodec::group_range) (used by the one-shot
+///   `decode_group`) sums `w0 + ... + w(k-1)` each time: **O(k)** byte reads, no state.
+///   Fine for a few lookups; decoding every chunk this way would cost O(G²) in total.
+/// - [`locate_groups`](RandomAccessCodec::locate_groups) (used by `GroupIndex`) does the
+///   prefix sum once for all chunks in **O(G)**, after which each lookup is **O(1)**.
+///   That mirrors SIMDBP's `Decompressor::init` + `decompress_block`.
+///
+/// Decoding a located chunk always unpacks 128 values (O(1) with respect to the row
+/// length), then copies only the real ones of a partial last chunk.
+impl RandomAccessCodec for Bp128 {
+    const GROUP_LEN: usize = CHUNK_LEN;
+
+    fn group_range(input: &[u8], n: usize, group: usize) -> Range<usize> {
+        let n_chunks = Self::num_groups(n);
+        assert!(
+            group < n_chunks,
+            "Bp128: group index {group} is out of range: a row of {n} values has {n_chunks} groups"
+        );
+        let widths = width_bytes(input, n_chunks);
+        // Data starts after all G width bytes, then skips the earlier chunks' data.
+        let skipped: usize = widths[..group].iter().map(|&w| chunk_bytes(w)).sum();
+        let start = n_chunks + skipped;
+        let end = start + chunk_bytes(widths[group]);
+        assert!(
+            end <= input.len(),
+            "Bp128: input ended in the middle of chunk {group}"
+        );
+        start..end
+    }
+
+    fn locate_groups(input: &[u8], n: usize, starts: &mut Vec<usize>) {
+        let n_chunks = Self::num_groups(n);
+        let widths = width_bytes(input, n_chunks);
+        starts.clear();
+        // `reserve` does nothing if the capacity is already big enough.
+        starts.reserve(n_chunks + 1);
+        let mut pos = n_chunks; // chunk 0's data starts right after the width bytes
+        for &width in widths {
+            starts.push(pos);
+            pos += chunk_bytes(width);
+        }
+        starts.push(pos); // end of the row
+        // Check once here, so later lookups through the index can't run off the end.
+        assert!(
+            pos <= input.len(),
+            "Bp128: input has {} bytes, but its width bytes describe {pos}",
+            input.len()
+        );
+    }
+
+    fn decode_group_bytes(data: &[u8], out: &mut [u16]) {
+        assert!(
+            out.len() <= CHUNK_LEN,
+            "Bp128: a group has at most {CHUNK_LEN} values, but out has {}",
+            out.len()
+        );
+        // The width isn't passed in: the data is exactly 16 × width bytes, so the
+        // length gives it back.
+        let n_bytes_per_bit = BitPacker4x::compressed_block_size(1); // 16
+        let width = data.len() / n_bytes_per_bit;
+        assert!(
+            data.len().is_multiple_of(n_bytes_per_bit) && width <= usize::from(MAX_BITS),
+            "Bp128: {} bytes is not a valid chunk size (must be 16 × width, width <= 8)",
+            data.len()
+        );
+        let width = width as u8; // <= 8, checked above
+        let mut scratch = [0u32; CHUNK_LEN];
+        unpack_chunk(&BitPacker4x::new(), data, width, &mut scratch, out);
+    }
+}
+
+/// The first `n_chunks` bytes of `input`: one width byte per chunk.
+fn width_bytes(input: &[u8], n_chunks: usize) -> &[u8] {
+    input.get(..n_chunks).unwrap_or_else(|| {
+        panic!(
+            "Bp128: need {n_chunks} width bytes, but input has only {}",
+            input.len()
+        )
+    })
 }

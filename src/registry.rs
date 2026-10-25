@@ -27,7 +27,7 @@
 //! 4. Update the expected list in the `registry_lists_exactly_the_implemented_codecs`
 //!    test (`tests/roundtrip.rs`).
 
-use crate::{BlockCodec, Bp128, Raw, VByte};
+use crate::{BlockCodec, Bp128, RandomAccessCodec, Raw, VByte};
 
 /// One variant per codec. `Copy` because it's just a tag (one byte), so passing it
 /// around by value is free.
@@ -86,6 +86,33 @@ impl Codec {
             Codec::Raw => Raw::decode(input, out),
             Codec::VByte => VByte::decode(input, out),
             Codec::Bp128 => Bp128::decode(input, out),
+        }
+    }
+
+    /// The group size if this codec supports random access ([`RandomAccessCodec`]),
+    /// or `None` if it doesn't (`VByte`).
+    pub fn group_len(self) -> Option<usize> {
+        match self {
+            Codec::Raw => Some(Raw::GROUP_LEN),
+            Codec::VByte => None,
+            Codec::Bp128 => Some(Bp128::GROUP_LEN),
+        }
+    }
+
+    /// Same as [`RandomAccessCodec::decode_group`] for this codec (one-shot, no index):
+    /// returns `Some(number of values written)`, or `None` if the codec doesn't
+    /// support random access. Panics on an invalid group index, like the trait.
+    pub fn decode_group(
+        self,
+        input: &[u8],
+        n: usize,
+        group: usize,
+        out: &mut [u16],
+    ) -> Option<usize> {
+        match self {
+            Codec::Raw => Some(Raw::decode_group(input, n, group, out)),
+            Codec::VByte => None,
+            Codec::Bp128 => Some(Bp128::decode_group(input, n, group, out)),
         }
     }
 }

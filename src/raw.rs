@@ -4,7 +4,9 @@
 //! same layout as Parker's dense `BlockData::Raw(Vec<u8>)`, and it's the 1-byte-per-value
 //! baseline every other codec is compared against.
 
-use crate::{BlockCodec, MAX_VALUE};
+use std::ops::Range;
+
+use crate::{BlockCodec, MAX_VALUE, RandomAccessCodec};
 
 /// Stores each value as a single byte.
 pub struct Raw;
@@ -39,5 +41,47 @@ impl BlockCodec for Raw {
             *value = u16::from(byte);
         }
         n_bytes
+    }
+}
+
+/// Random access in 128-value groups. Every value is one byte, so group g's data is
+/// simply bytes `128 × g ..` and locating it is **O(1)** arithmetic with no metadata.
+/// (Any group size would work; 128 matches `BLOCK_SIZE` and `Bp128`.)
+impl RandomAccessCodec for Raw {
+    const GROUP_LEN: usize = 128;
+
+    fn group_range(input: &[u8], n: usize, group: usize) -> Range<usize> {
+        let len = Self::group_len(n, group); // also checks the group index
+        let start = group * Self::GROUP_LEN;
+        let end = start + len;
+        assert!(
+            end <= input.len(),
+            "Raw: input ended in the middle of group {group}"
+        );
+        start..end
+    }
+
+    fn locate_groups(input: &[u8], n: usize, starts: &mut Vec<usize>) {
+        assert!(
+            input.len() >= n,
+            "Raw: need {n} bytes for {n} values, but input has only {}",
+            input.len()
+        );
+        starts.clear();
+        // Group starts are 0, 128, 256, ..., and the row ends at byte n.
+        starts.extend((0..n).step_by(Self::GROUP_LEN));
+        starts.push(n);
+    }
+
+    fn decode_group_bytes(data: &[u8], out: &mut [u16]) {
+        assert_eq!(
+            data.len(),
+            out.len(),
+            "Raw: a group of {} values needs exactly that many bytes",
+            out.len()
+        );
+        for (value, &byte) in out.iter_mut().zip(data) {
+            *value = u16::from(byte);
+        }
     }
 }
