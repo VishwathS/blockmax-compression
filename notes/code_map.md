@@ -214,9 +214,9 @@ A drop-in replacement for the SIMDBP variant would need:
     `2^b − 1` without decoding, which might let the search skip groups. This is a design
     idea, not something the current code does.
 
-The Stage 3 `BlockCodec` trait (u32, encode/decode a whole block, no cursor, no random
-access) covers only items 3 and 5. Items 4 and 6 are what the later u16 + random-access
-stage needs to add.
+The current `BlockCodec` trait (u16 values <= 255, encode/decode a whole block, no
+cursor, no random access) covers only items 1, 3 and 5. Items 4 and 6 are what the
+later random-access stage needs to add.
 
 ## (b) Questions to verify yourself (not answered here)
 

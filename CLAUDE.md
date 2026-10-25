@@ -41,10 +41,17 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
   the SIMDBP **AVX-512 path (groups of 512, 32 u16s per register)**.
 
 ## This crate (codecs)
-- `BlockCodec` trait in `src/lib.rs` (u32 in, bytes out). A later stage moves it to u16
-  with random access.
-- Codecs: `src/raw.rs` (`Raw`, 4 LE bytes/value) and `src/vbyte.rs` (`VByte`: 7-bit
-  groups, low-order first, stop bit = high bit set on the LAST byte).
+- `BlockCodec` trait in `src/lib.rs`. Contract:
+  - Inputs are `u16`, every value `<= 255` (`codecs::MAX_VALUE`).
+  - `encode(input: &[u16], out: &mut Vec<u8>)` appends bytes. It `debug_assert!`s that
+    every value is `<= 255`.
+  - `decode(input: &[u8], out: &mut [u16]) -> usize` fills `out` and returns the
+    number of bytes consumed.
+  - No random access yet; a later stage adds it.
+- Codecs: `src/raw.rs` (`Raw`, 1 byte/value, the baseline, same as Parker's
+  `BlockData::Raw`) and `src/vbyte.rs` (`VByte`: 7-bit groups, low-order first, stop
+  bit = high bit set on the LAST byte; 0..=127 → 1 byte, 128..=255 → 2 bytes).
+- Size report: `cargo run --release --example size_report` (synthetic datasets).
 - Tests are in `tests/roundtrip.rs` (generic roundtrip helper + proptest).
 - Before committing, `cargo fmt`, `cargo clippy`, and `cargo test` must all pass.
 - Notes go in `notes/` (e.g. `notes/code_map.md`).

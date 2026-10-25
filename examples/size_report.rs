@@ -2,21 +2,22 @@
 //!
 //! Run with: `cargo run --release --example size_report`
 
-use codecs::{BlockCodec, Raw, VByte};
+use codecs::{BlockCodec, MAX_VALUE, Raw, VByte};
 
-/// Number of passages in MS MARCO, used as the doc-ID range for the gap datasets.
-const MSMARCO_DOCS: u32 = 8_841_823;
+/// Values per dataset. Large enough that per-block effects (like a partial last
+/// block) don't affect the averages.
+const N: usize = 1_000_000;
 
 /// Encodes `values` in BLOCK_SIZE blocks (the way an index would store them),
 /// checks that it decodes back correctly, and returns the total encoded size in bytes.
-fn encoded_size<C: BlockCodec>(values: &[u32]) -> usize {
+fn encoded_size<C: BlockCodec>(values: &[u16]) -> usize {
     let mut encoded = Vec::new();
     for block in values.chunks(C::BLOCK_SIZE) {
         C::encode(block, &mut encoded);
     }
 
     // Sanity check: a size number is meaningless if the codec is wrong.
-    let mut decoded = vec![0u32; values.len()];
+    let mut decoded = vec![0u16; values.len()];
     let mut pos = 0;
     for block in decoded.chunks_mut(C::BLOCK_SIZE) {
         pos += C::decode(&encoded[pos..], block);
@@ -39,59 +40,60 @@ impl XorShift64 {
         self.0 = x;
         x
     }
+
+    /// A random value in `lo..=hi`. (`%` is slightly biased unless the range size is
+    /// a power of two, but the bias is far too small to matter for a size report.)
+    fn in_range(&mut self, lo: u16, hi: u16) -> u16 {
+        let span = u64::from(hi - lo) + 1;
+        lo + (self.next() % span) as u16
+    }
 }
 
-/// Builds a synthetic posting list: each doc in 0..MSMARCO_DOCS is included with
-/// probability `per_million / 1_000_000`. Returns the d-gaps: the first doc ID itself,
-/// then the difference between each doc ID and the one before it.
-fn doc_id_gaps(per_million: u64, seed: u64) -> Vec<u32> {
+/// `N` values drawn uniformly from `0..=max`.
+fn uniform(max: u16, seed: u64) -> Vec<u16> {
     let mut rng = XorShift64(seed);
-    let mut gaps = Vec::new();
-    let mut previous = 0;
-    for doc_id in 0..MSMARCO_DOCS {
-        if rng.next() % 1_000_000 < per_million {
-            gaps.push(doc_id - previous);
-            previous = doc_id;
-        }
-    }
-    gaps
+    (0..N).map(|_| rng.in_range(0, max)).collect()
+}
+
+/// Imitates one term's block maxes: most blocks have no posting for the term (max 0),
+/// most of the rest have a small max, and a few have a large one.
+/// - 90%: 0
+/// - 9%: 1..=20
+/// - 1%: outliers, 21..=255
+fn block_max_like(seed: u64) -> Vec<u16> {
+    let mut rng = XorShift64(seed);
+    (0..N)
+        .map(|_| match rng.next() % 100 {
+            0..90 => 0,
+            90..99 => rng.in_range(1, 20),
+            _ => rng.in_range(21, MAX_VALUE),
+        })
+        .collect()
 }
 
 fn main() {
-    // (name, values, can it be stored as raw u8?)
-    let datasets: Vec<(String, Vec<u32>, bool)> = vec![
-        ("values 0..=255".into(), (0..=255).collect(), true),
-        ("values 0..=15".into(), (0..=15).collect(), true),
-        (
-            "doc gaps, 10% of docs".into(),
-            doc_id_gaps(100_000, 1),
-            false,
-        ),
-        ("doc gaps, 1% of docs".into(), doc_id_gaps(10_000, 2), false),
-        (
-            "doc gaps, 0.1% of docs".into(),
-            doc_id_gaps(1_000, 3),
-            false,
-        ),
+    let datasets: Vec<(&str, Vec<u16>)> = vec![
+        ("uniform 0..=255", uniform(MAX_VALUE, 1)),
+        ("uniform 0..=15 (4-bit)", uniform(15, 2)),
+        ("all zeros", vec![0; N]),
+        ("block-max-like", block_max_like(3)),
     ];
 
     println!(
-        "{:<24} {:>9} {:>9} {:>11} {:>9} {:>9}",
-        "dataset", "n", "mean", "raw u8", "Raw", "VByte"
+        "{:<24} {:>9} {:>7} {:>7} {:>7} {:>7}",
+        "dataset", "n", "mean", "zeros", "Raw", "VByte"
     );
-    for (name, values, fits_in_u8) in &datasets {
+    for (name, values) in &datasets {
         let n = values.len();
-        // Mean value, to show how big the numbers are.
-        let mean = values.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        // Mean value and share of zeros, to show what the data looks like.
+        let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+        let zeros = values.iter().filter(|&&v| v == 0).count() as f64 / n as f64;
         let raw = encoded_size::<Raw>(values) as f64 / n as f64;
         let vbyte = encoded_size::<VByte>(values) as f64 / n as f64;
-        // Parker's `BlockData::Raw` stores one byte per block max, so 1.0 B/value.
-        let raw_u8 = if *fits_in_u8 {
-            "1.000".to_string()
-        } else {
-            "n/a".to_string()
-        };
-        println!("{name:<24} {n:>9} {mean:>9.1} {raw_u8:>11} {raw:>9.3} {vbyte:>9.3}");
+        println!(
+            "{name:<24} {n:>9} {mean:>7.2} {:>6.1}% {raw:>7.3} {vbyte:>7.3}",
+            zeros * 100.0
+        );
     }
-    println!("(columns raw u8 / Raw / VByte are bytes per value)");
+    println!("(Raw / VByte columns are bytes per value)");
 }

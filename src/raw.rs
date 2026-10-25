@@ -1,38 +1,40 @@
-//! `Raw`: no compression. Each value is stored as 4 little-endian bytes.
+//! `Raw`: no compression. Each value is stored as one byte.
 //!
-//! This is the baseline every other codec is compared against.
+//! Every value is at most 255 (see [`BlockCodec`]), so one byte is enough. This is the
+//! same layout as Parker's dense `BlockData::Raw(Vec<u8>)`, and it's the 1-byte-per-value
+//! baseline every other codec is compared against.
 
-use crate::BlockCodec;
+use crate::{BlockCodec, MAX_VALUE};
 
-/// Stores each `u32` as its 4 bytes, least significant byte first.
+/// Stores each value as a single byte.
 pub struct Raw;
 
 impl BlockCodec for Raw {
     const BLOCK_SIZE: usize = 128;
 
-    fn encode(input: &[u32], out: &mut Vec<u8>) {
+    fn encode(input: &[u16], out: &mut Vec<u8>) {
         // We know the exact output size, so grow the buffer once up front.
-        out.reserve(input.len() * 4);
+        out.reserve(input.len());
         for &value in input {
-            // e.g. 0x0102_0304 becomes [0x04, 0x03, 0x02, 0x01].
-            out.extend_from_slice(&value.to_le_bytes());
+            debug_assert!(
+                value <= MAX_VALUE,
+                "Raw: value {value} is above {MAX_VALUE}"
+            );
+            // `as u8` keeps the low 8 bits, which is the whole value when it's <= 255.
+            out.push(value as u8);
         }
     }
 
-    fn decode(input: &[u8], out: &mut [u32]) -> usize {
-        let n_bytes = out.len() * 4;
+    fn decode(input: &[u8], out: &mut [u16]) -> usize {
+        let n_bytes = out.len(); // one byte per value
         assert!(
             input.len() >= n_bytes,
-            "Raw: need {n_bytes} bytes to decode {} values, but input has only {}",
-            out.len(),
+            "Raw: need {n_bytes} bytes to decode {n_bytes} values, but input has only {}",
             input.len()
         );
-        // `as_chunks::<4>()` views the bytes as a slice of `[u8; 4]` arrays (plus a
-        // leftover tail, which is empty here because n_bytes is a multiple of 4).
-        let (chunks, _empty_tail) = input[..n_bytes].as_chunks::<4>();
-        for (value, bytes) in out.iter_mut().zip(chunks) {
-            // e.g. [0x04, 0x03, 0x02, 0x01] becomes 0x0102_0304.
-            *value = u32::from_le_bytes(*bytes);
+        for (value, &byte) in out.iter_mut().zip(&input[..n_bytes]) {
+            // `u16::from` widens the byte losslessly (e.g. 200u8 becomes 200u16).
+            *value = u16::from(byte);
         }
         n_bytes
     }
