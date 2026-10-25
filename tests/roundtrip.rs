@@ -2,7 +2,7 @@
 //!
 //! Every generated value is in 0..=255, the range the `BlockCodec` contract allows.
 
-use codecs::{BlockCodec, Bp128, MAX_VALUE, Raw, VByte};
+use codecs::{BlockCodec, Bp128, Codec, MAX_VALUE, Raw, VByte};
 use proptest::prelude::*;
 
 /// Encodes `input` with codec `C`, decodes it again, and checks that we get the same
@@ -315,6 +315,94 @@ fn bp128_rejects_values_above_255() {
     Bp128::encode(&input, &mut Vec::new());
 }
 
+// ---------- codec registry ----------
+// `Codec` (src/registry.rs) forwards to the codec types. These tests check that the
+// list is complete, the names are stable, and that going through the registry gives
+// exactly the same bytes and byte counts as calling the codec type directly.
+
+#[test]
+fn registry_lists_exactly_the_implemented_codecs() {
+    // Update this list (and only this list) when a codec is added.
+    assert_eq!(Codec::ALL, [Codec::Raw, Codec::VByte, Codec::Bp128]);
+    let names: Vec<&str> = Codec::ALL.iter().map(|codec| codec.name()).collect();
+    // These exact strings appear in reports, so they must not change by accident.
+    assert_eq!(names, ["Raw", "VByte", "Bp128"]);
+}
+
+#[test]
+fn registry_names_are_unique_and_found_by_from_name() {
+    for codec in Codec::ALL {
+        // Each name maps back to its own codec, so no two codecs share a name.
+        assert_eq!(Codec::from_name(codec.name()), Some(codec));
+        // Lookup ignores case, e.g. "bp128" and "BP128" both find Bp128.
+        assert_eq!(Codec::from_name(&codec.name().to_lowercase()), Some(codec));
+        assert_eq!(Codec::from_name(&codec.name().to_uppercase()), Some(codec));
+    }
+    assert_eq!(Codec::from_name("NoSuchCodec"), None);
+    assert_eq!(Codec::from_name(""), None);
+}
+
+/// Encodes with the codec type directly, without the registry. Written out by hand
+/// on purpose: if a registry `match` arm pointed at the wrong codec, the bytes from
+/// the registry would differ from these.
+fn encode_directly(codec: Codec, input: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match codec {
+        Codec::Raw => Raw::encode(input, &mut out),
+        Codec::VByte => VByte::encode(input, &mut out),
+        Codec::Bp128 => Bp128::encode(input, &mut out),
+    }
+    out
+}
+
+#[test]
+fn registry_matches_the_codec_types() {
+    assert_eq!(Codec::Raw.block_size(), Raw::BLOCK_SIZE);
+    assert_eq!(Codec::VByte.block_size(), VByte::BLOCK_SIZE);
+    assert_eq!(Codec::Bp128.block_size(), Bp128::BLOCK_SIZE);
+
+    for codec in Codec::ALL {
+        for (name, input) in fixed_cases() {
+            println!("{}: {name}", codec.name()); // shown only if the test fails
+            let mut encoded = Vec::new();
+            codec.encode(&input, &mut encoded);
+            assert_eq!(encoded, encode_directly(codec, &input));
+
+            // Same round-trip checks as `roundtrip::<C>`, through the registry.
+            let mut decoded = vec![0u16; input.len()];
+            let consumed = codec.decode(&encoded, &mut decoded);
+            assert_eq!(decoded, input);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+}
+
+#[test]
+fn registry_concatenated_encodes_decode_in_order() {
+    // Every fixed case appended to one buffer, then decoded back one by one using
+    // the byte counts `decode` returns, for every codec in the registry.
+    let pieces: Vec<Vec<u16>> = fixed_cases().into_iter().map(|(_, v)| v).collect();
+    for codec in Codec::ALL {
+        let mut buffer = Vec::new();
+        for piece in &pieces {
+            codec.encode(piece, &mut buffer);
+        }
+        let mut pos = 0;
+        for piece in &pieces {
+            let mut decoded = vec![0u16; piece.len()];
+            pos += codec.decode(&buffer[pos..], &mut decoded);
+            assert_eq!(&decoded, piece, "{}", codec.name());
+        }
+        assert_eq!(pos, buffer.len(), "{}: bytes left over", codec.name());
+    }
+}
+
+#[test]
+#[should_panic(expected = "above 255")]
+fn registry_encode_keeps_the_range_check() {
+    Codec::Bp128.encode(&[256], &mut Vec::new());
+}
+
 // ---------- property tests ----------
 // proptest generates hundreds of random inputs per test. When one fails, it shrinks it
 // to a minimal failing example and prints it.
@@ -339,6 +427,19 @@ proptest! {
     #[test]
     fn bp128_roundtrips_random(input in block()) {
         roundtrip::<Bp128>(&input);
+    }
+
+    /// The same random input through every codec in the registry.
+    #[test]
+    fn registry_roundtrips_random(input in block()) {
+        for codec in Codec::ALL {
+            let mut encoded = Vec::new();
+            codec.encode(&input, &mut encoded);
+            let mut decoded = vec![0u16; input.len()];
+            let consumed = codec.decode(&encoded, &mut decoded);
+            prop_assert_eq!(&decoded, &input, "{}", codec.name());
+            prop_assert_eq!(consumed, encoded.len(), "{}", codec.name());
+        }
     }
 
     /// Small values (like 4-bit quantized maxes) with a random max width, so Bp128

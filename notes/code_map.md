@@ -228,6 +228,8 @@ all-zero 128-value chunk costs one width byte and no data.
 | `Bp128` | `src/bp128.rs` | done | 16 × width + 1 bytes per 128 values |
 | SIMDBP port | (not started) | stage 6 | |
 
+All three are registered in `codecs::Codec` (`src/registry.rs`, see below).
+
 Size report, 1M values per dataset (`cargo run --release --example size_report`):
 
 | dataset | Raw | VByte | Bp128 |
@@ -276,9 +278,34 @@ Size report, 1M values per dataset (`cargo run --release --example size_report`)
   outliers separately. Real block maxes may differ from this synthetic mix, so check on
   `export_data` output (stage 5) before optimizing.
 
+### Codec registry (`src/registry.rs`, stage 4)
+- `codecs::Codec` is an enum with one variant per codec (`Raw`, `VByte`, `Bp128`).
+  `Codec::ALL` lists them in report order. `name()` gives the stable display name,
+  `from_name()` looks one up (case-insensitive), and `block_size()` / `encode()` /
+  `decode()` forward to the codec type with a `match`. The `BlockCodec` trait and
+  every byte format are unchanged; the registry only forwards calls.
+- The size report loops over `Codec::ALL`, so a new codec gets a column automatically.
+  The refactor printed byte-for-byte the same report as before.
+- Adding a codec: implement `BlockCodec`, add a variant + append it to `ALL`, add an arm
+  to each `match` (the compiler points out every missing one), and update the expected
+  list in `registry_lists_exactly_the_implemented_codecs`.
+
+Open questions for later stages:
+- **Dispatch cost in benchmarks.** The `match` runs once per `encode`/`decode` call
+  (one 128-value block), which should be negligible, but stage 8 should time the hot
+  decode loop through the generic `C: BlockCodec` path too, to confirm.
+- **Parameterized codecs.** A codec with settings (e.g. Bp with 32- or 512-value chunks,
+  or a PFor exception threshold) is a separate type today, so it would be a separate
+  variant. If there end up being many such settings, a variant could carry them
+  (`Codec::Bp { chunk: usize }`); not needed yet.
+- **SIMDBP may not fit the trait as is.** It's built for random access to one group,
+  and its group size depends on the SIMD width (512 on this machine). Stage 6 may need
+  the random-access trait discussion first.
+
 ### Next stages (see `CLAUDE.md`)
-4. Codec registry, 5. real index loader (`export_data` matrices), 6. SIMDBP integration,
-7. CLI, 8. benchmarking (criterion speed + bytes per value on real data).
+Done: 4. codec registry. Next: 5. real index loader (`export_data` matrices),
+6. SIMDBP integration, 7. CLI, 8. benchmarking (criterion speed + bytes per value on
+real data).
 
 ## (b) Questions to verify yourself (not answered here)
 

@@ -8,14 +8,19 @@
 //! code and the query loop still work on `u16`, because that leaves room to multiply a
 //! max by a query weight without overflowing. Using `u16` here too means a codec can be
 //! dropped into that code without converting.
+//!
+//! To loop over every codec (reports, benchmarks), use [`Codec::ALL`] from the
+//! [`registry`] module.
 
 pub mod bp128;
 pub mod raw;
+pub mod registry;
 pub mod vbyte;
 
 // Re-export the codec types so users can write `codecs::Raw` instead of `codecs::raw::Raw`.
 pub use bp128::Bp128;
 pub use raw::Raw;
+pub use registry::Codec;
 pub use vbyte::VByte;
 
 /// The largest value a codec has to handle. Inputs above this break the contract.

@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 bitpacking = "0.9.3"
 
+# `test = true` makes `cargo test` also run the unit tests inside this example.
+[[example]]
+name = "size_report"
+test = true
+
 [dev-dependencies]
 criterion = "0.8.2"
 proptest = "1.12.0"

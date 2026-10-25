@@ -2,26 +2,35 @@
 //!
 //! Run with: `cargo run --release --example size_report`
 
-use codecs::{BlockCodec, Bp128, MAX_VALUE, Raw, VByte};
+use codecs::{Codec, MAX_VALUE};
 
 /// Values per dataset. Large enough that per-block effects (like a partial last
 /// block) don't affect the averages.
 const N: usize = 1_000_000;
 
-/// Encodes `values` in BLOCK_SIZE blocks (the way an index would store them),
-/// checks that it decodes back correctly, and returns the total encoded size in bytes.
-fn encoded_size<C: BlockCodec>(values: &[u16]) -> usize {
+/// Encodes `values` with `codec` in blocks of its block size (the way an index would
+/// store them), checks that it decodes back correctly, and returns the total encoded
+/// size in bytes.
+fn encoded_size(codec: Codec, values: &[u16]) -> usize {
+    let block_size = codec.block_size();
     let mut encoded = Vec::new();
-    for block in values.chunks(C::BLOCK_SIZE) {
-        C::encode(block, &mut encoded);
+    for block in values.chunks(block_size) {
+        codec.encode(block, &mut encoded);
     }
 
     // Sanity check: a size number is meaningless if the codec is wrong.
     let mut decoded = vec![0u16; values.len()];
     let mut pos = 0;
-    for block in decoded.chunks_mut(C::BLOCK_SIZE) {
-        pos += C::decode(&encoded[pos..], block);
+    for block in decoded.chunks_mut(block_size) {
+        pos += codec.decode(&encoded[pos..], block);
     }
+    // Every byte must be accounted for: decode's byte counts have to add up exactly.
+    assert_eq!(
+        pos,
+        encoded.len(),
+        "{}: decode left bytes unread",
+        codec.name()
+    );
     assert_eq!(decoded, values, "round trip failed");
 
     encoded.len()
@@ -79,22 +88,59 @@ fn main() {
         ("block-max-like", block_max_like(3)),
     ];
 
-    println!(
-        "{:<24} {:>9} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "dataset", "n", "mean", "zeros", "Raw", "VByte", "Bp128"
-    );
+    // Header: the fixed columns, then one column per codec in the registry.
+    print!("{:<24} {:>9} {:>7} {:>7}", "dataset", "n", "mean", "zeros");
+    for codec in Codec::ALL {
+        print!(" {:>7}", codec.name());
+    }
+    println!();
+
     for (name, values) in &datasets {
         let n = values.len();
         // Mean value and share of zeros, to show what the data looks like.
         let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
         let zeros = values.iter().filter(|&&v| v == 0).count() as f64 / n as f64;
-        let raw = encoded_size::<Raw>(values) as f64 / n as f64;
-        let vbyte = encoded_size::<VByte>(values) as f64 / n as f64;
-        let bp128 = encoded_size::<Bp128>(values) as f64 / n as f64;
-        println!(
-            "{name:<24} {n:>9} {mean:>7.2} {:>6.1}% {raw:>7.3} {vbyte:>7.3} {bp128:>7.3}",
-            zeros * 100.0
-        );
+        print!("{name:<24} {n:>9} {mean:>7.2} {:>6.1}%", zeros * 100.0);
+        for codec in Codec::ALL {
+            let bytes_per_value = encoded_size(codec, values) as f64 / n as f64;
+            print!(" {bytes_per_value:>7.3}");
+        }
+        println!();
     }
-    println!("(Raw / VByte / Bp128 columns are bytes per value)");
+
+    // e.g. "(Raw / VByte / Bp128 columns are bytes per value)"
+    let names: Vec<&str> = Codec::ALL.iter().map(|codec| codec.name()).collect();
+    println!("({} columns are bytes per value)", names.join(" / "));
+}
+
+// These tests run with `cargo test` because Cargo.toml sets `test = true` for this
+// example. They check the report's own `encoded_size` against every registered codec.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_size_works_for_every_codec() {
+        // 300 values = blocks of 128, 128, 44 for every codec (all use block size 128).
+        let zeros = vec![0u16; 300];
+        let small = vec![3u16; 300]; // 2 bits each
+        for codec in Codec::ALL {
+            // Every codec must at least round trip; `encoded_size` asserts that.
+            assert!(encoded_size(codec, &small) > 0, "{}", codec.name());
+            // The exact sizes below are the same numbers the old, hand-written
+            // report produced, so going through the registry changed nothing.
+            let expected_zeros = match codec {
+                Codec::Raw | Codec::VByte => 300, // 1 byte per value
+                Codec::Bp128 => 3,                // 1 width byte per block, no data
+            };
+            assert_eq!(
+                encoded_size(codec, &zeros),
+                expected_zeros,
+                "{}",
+                codec.name()
+            );
+        }
+        // Bp128 on width-2 data: 3 blocks × (1 width byte + 16 × 2 data bytes).
+        assert_eq!(encoded_size(Codec::Bp128, &small), 3 * (1 + 32));
+    }
 }

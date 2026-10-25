@@ -7,7 +7,10 @@ for the user to say "continue".
 
 ## Ground rules
 - `~/hierarchical_pruning` is Parker's repo and stays **read-only**. Never edit it.
-- Never `git push`. Committing in `~/codecs` is fine when a stage asks for it.
+- Only push changes to `VishwathS/blockmax-compression` when explicitly requested.
+  Never modify or push to Parker's repository. Verify the Git remote
+  (`git remote -v`) before every push. Committing in `~/codecs` is fine when a stage
+  asks for it.
 - Both repos live inside WSL Ubuntu (`/home/vishw/...`). Run cargo inside WSL, not on Windows.
 
 ## Research goal
@@ -63,20 +66,34 @@ block of consecutive doc IDs, the max impact score. A query sums these per block
     zero-padded to 128 (like SIMDBP's last group). u16 is widened to u32 for the crate.
   - Caveat: the crate uses a scalar packer in debug builds and SIMD in release builds.
     `bp128_known_bytes` pins the bytes, so run `cargo test --release` too.
-- Size report: `cargo run --release --example size_report` (synthetic datasets,
-  columns Raw / VByte / Bp128 in bytes per value).
+- Codec registry: `src/registry.rs`, re-exported as `codecs::Codec`. An enum with one
+  variant per codec; `Codec::ALL` lists them all (Raw, VByte, Bp128), `name()` gives a
+  stable display name, `from_name()` looks one up (case-insensitive), and
+  `block_size()` / `encode()` / `decode()` forward to the codec type via `match`. It
+  doesn't change the trait or any byte format. Anything that loops over codecs
+  (reports, CLI, benchmarks) should use `Codec::ALL`, not list codecs by hand.
+  To add a codec:
+  1. implement `BlockCodec` in its own file
+  2. add a variant to `Codec` and append it to `Codec::ALL`
+  3. add an arm to each `match` in `registry.rs` (the compiler flags any missing one)
+  4. update the expected list in the `registry_lists_exactly_the_implemented_codecs` test
+- Size report: `cargo run --release --example size_report` (synthetic datasets, one
+  bytes-per-value column per registered codec). Its unit test runs with `cargo test`
+  (`test = true` in `Cargo.toml`).
 - Tests are in `tests/roundtrip.rs` (generic roundtrip helper + proptest, exact-format
-  tests, panic tests).
+  tests, panic tests, registry tests that compare registry output with direct calls).
+- Open design questions (details in `notes/code_map.md` section (c)): parameterized
+  codecs as enum variants with fields, measuring `match` dispatch cost in stage 8, and
+  whether SIMDBP fits the trait without random access.
 - Before committing, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, and `cargo test --release` must all pass. This crate builds on stable;
   the nightly toolchain is only for Parker's repo.
 - Notes go in `notes/` (e.g. `notes/code_map.md`, which also has the codec status).
 
 ## Stages
-Done: (1) BlockCodec trait + Raw + VByte, (2) switch to u16 values <= 255, (3) BP128.
+Done: (1) BlockCodec trait + Raw + VByte, (2) switch to u16 values <= 255, (3) BP128,
+(4) codec registry (`codecs::Codec`, size report loops over it).
 Next, in order (do not start one without the user saying "continue"):
-4. Codec registry: list/select codecs by name so the size report, CLI, and benchmarks
-   loop over all codecs instead of hard-coding them.
 5. Real index loader: read `export_data` matrices (`u32 n_terms`, `u32 n_blocks`, u8
    T×C grid) so codecs run on real MS MARCO block maxes instead of synthetic data.
 6. SIMDBP integration: port or call Parker's SIMDBP format as a codec, to compare
