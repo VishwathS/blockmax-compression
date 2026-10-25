@@ -53,12 +53,53 @@ space-separated `key=value` fields:
 | `offsets` | his `Decompressor.accumulated_offsets` (group starts, in units of STRIDE u16) |
 | `tc<size>` | his `transcode` of the output to another block size: `u16 length:FNV-1a of its bytes` |
 | `tc_back` | `ok` if transcoding there and back gives his bytes again |
-| `bytes` | his `compress` output as little-endian bytes, in hex |
+| `bytes_fnv` | FNV-1a 64 of his `compress` output bytes (every case) |
+| `bytes` | his `compress` output as little-endian bytes, in hex; **only if it is at most 32 KiB** (`MAX_INLINE_BYTES`), otherwise left out |
 
 The cases (sizes scale with the group size GL): n = 1 (0 and 255), one full group at
 each width 0..=8, GL/2 + 3, GL + 1, GL − 1, 3·GL, all 255, 20 groups with widths
 cycling 0..=8, an invented block-max-like mix, GL² (one full metablock),
-GL² + 2·GL + 9 (second metablock), and 2·GL² + 1 (third metablock with one value).
+GL² + 2·GL + 9 (second metablock), 2·GL² + 1 (third metablock with one value),
+2·GL² + 5·GL + 7 with every header slot nonzero across three metablocks
+(`headers:20`), and GL² + 3·GL + 1 with random per-group widths (`randgroups:21`).
+With 32 KiB as the limit, every case has full bytes at 128; at 256 and 512 the last two
+cases have only `words` + `bytes_fnv`.
+
+### Hash algorithm
+
+FNV-1a, 64-bit: start from `0xcbf29ce484222325`; for each byte, XOR it in, then
+multiply by `0x100000001b3` (wrapping). It is written out in both `src/main.rs` and
+`tests/simdbp.rs`. It is a checksum, not a cryptographic hash: it detects accidental
+differences, which is all these comparisons need.
+
+### What the test does with each case (`tests/simdbp.rs`)
+
+1. Regenerates the input from `gen` and requires its FNV-1a to equal `input_fnv`
+   (proves our generator produced the oracle's exact input, before any output is
+   compared).
+2. With `bytes`: our encoding must equal them byte for byte. Without: our encoding
+   must have length `2 × words` and FNV-1a `bytes_fnv`. (A hash match shows agreement
+   for that input, with a negligible chance of coincidence; it is not a byte diff.)
+3. Decodes his bytes (or ours, once they match) and checks widths, offsets, random
+   access, and the transcode hashes.
+4. `golden_cases_cover_every_header_field` checks, from his widths, that the cases put
+   a nonzero width in every header slot (every word, 4-bit position, and lane) in at
+   least three metablocks.
+
+### Checking that the committed files are reproducible
+
+The program is deterministic, so regenerating on the same machine and toolchain must
+give byte-identical files. To check without touching the working copy, regenerate in
+a throwaway copy next to it (so `../../../hierarchical_pruning` still finds Parker's
+repo), then compare:
+
+```sh
+rm -rf ~/codecs_audit
+rsync -a --exclude target --exclude .git ~/codecs/ ~/codecs_audit/
+~/codecs_audit/tools/simdbp_oracle/regenerate.sh
+diff -r ~/codecs/tests/data/simdbp ~/codecs_audit/tests/data/simdbp
+diff ~/codecs/notes/simdbp_oracle_probes.txt ~/codecs_audit/notes/simdbp_oracle_probes.txt
+```
 
 ## Probes
 

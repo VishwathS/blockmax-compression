@@ -93,6 +93,37 @@ fn generate(spec: &str, n: usize, gl: usize) -> Vec<u16> {
                 })
                 .collect()
         }
+        // Group g has width (g + 3 × (g / GL)) % 9: inside metablock m, slot s gets
+        // width (s + 3m) % 9, so every header slot is nonzero in metablock 0 or 1 (all
+        // header words, field positions, and lanes are used), and a slot has different
+        // widths in different metablocks. Each group's first value is its max.
+        "headers" => {
+            let mut rng = XorShift64(num(1));
+            (0..n)
+                .map(|i| {
+                    let r = rng.next();
+                    let g = i / gl;
+                    let w = (g + 3 * (g / gl)) % 9;
+                    let mask = ((1u32 << w) - 1) as u16;
+                    if i % gl == 0 { mask } else { r as u16 & mask }
+                })
+                .collect()
+        }
+        // Group g has a pseudo-random width 0..=8, taken from a multiplicative hash of
+        // g and SEED (not from the value stream). Each group's first value is its max.
+        "randgroups" => {
+            let seed = num(1);
+            let mut rng = XorShift64(seed);
+            (0..n)
+                .map(|i| {
+                    let r = rng.next();
+                    let g = (i / gl) as u64;
+                    let w = ((g ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 9;
+                    let mask = ((1u32 << w) - 1) as u16;
+                    if i % gl == 0 { mask } else { r as u16 & mask }
+                })
+                .collect()
+        }
         // Synthetic "block-max-like": 90% zeros, 9% in 1..=20, 1% in 21..=255.
         "blockmax" => {
             let mut rng = XorShift64(num(1));
@@ -136,9 +167,18 @@ fn cases(gl: usize) -> Vec<(String, usize, String)> {
         ("metablock_cross".into(), gl * gl + 2 * gl + 9, "sparse:18".into()),
         // A third metablock holding a single 1-value group.
         ("two_metablocks_plus_one".into(), 2 * gl * gl + 1, "sparse:19".into()),
+        // Every header word, field position, and lane nonzero; three metablocks, the
+        // last one with 6 groups (the last partial).
+        ("all_header_fields".into(), 2 * gl * gl + 5 * gl + 7, "headers:20".into()),
+        // Random per-group widths across a metablock boundary.
+        ("random_group_widths".into(), gl * gl + 3 * gl + 1, "randgroups:21".into()),
     ]);
     cases
 }
+
+/// Outputs up to this many bytes are written out in full (`bytes=`); longer ones only
+/// as a length and an FNV-1a hash, to keep the golden files small.
+const MAX_INLINE_BYTES: usize = 32 * 1024;
 
 /// FNV-1a, 64 bit: a simple, well-known hash, written out so the tests can repeat it.
 fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
@@ -186,8 +226,10 @@ fn golden(args: &[String]) {
     writeln!(out, "# DO NOT EDIT: regenerate with tools/simdbp_oracle/regenerate.sh").unwrap();
     writeln!(out, "# parker_commit={commit}").unwrap();
     writeln!(out, "# build={label} block_size={bs} rustflags=\"{rustflags}\" rustc=\"{rustc}\"").unwrap();
-    writeln!(out, "# fields: name n gen input_fnv parker_roundtrip words widths offsets tc<size>=len:fnv tc_back bytes").unwrap();
+    writeln!(out, "# fields: name n gen input_fnv parker_roundtrip words widths offsets tc<size>=len:fnv tc_back bytes_fnv [bytes]").unwrap();
     writeln!(out, "#   words: length of compress() output in u16; bytes: that output as little-endian hex").unwrap();
+    writeln!(out, "#   bytes_fnv: FNV-1a 64 of those bytes; bytes is present only if they are <= {MAX_INLINE_BYTES} bytes").unwrap();
+    writeln!(out, "#   input_fnv: FNV-1a 64 of the generated input as little-endian u16 bytes").unwrap();
     writeln!(out, "#   widths/offsets: Decompressor.offsets / accumulated_offsets after init (offsets in units of {} u16)", bs / 16).unwrap();
     writeln!(out, "#   tc<size>: transcode() of the output to another block size: u16 length and FNV-1a of its bytes").unwrap();
 
@@ -228,15 +270,21 @@ fn golden(args: &[String]) {
             }
         }
 
+        let bytes = le_bytes(&compressed);
+        let bytes_field = if bytes.len() <= MAX_INLINE_BYTES {
+            format!(" bytes={}", hex(&bytes))
+        } else {
+            String::new() // too long: only the hash (bytes_fnv) is stored
+        };
         writeln!(
             out,
-            "case name={name} n={n} gen={spec} input_fnv={input_fnv:#018x} parker_roundtrip={} words={} widths={} offsets={}{tc_fields} tc_back={} bytes={}",
+            "case name={name} n={n} gen={spec} input_fnv={input_fnv:#018x} parker_roundtrip={} words={} widths={} offsets={}{tc_fields} tc_back={} bytes_fnv={:#018x}{bytes_field}",
             if roundtrip_ok { "ok" } else { "FAIL" },
             compressed.len(),
             join(&widths),
             join(&offsets),
             if tc_back_ok { "ok" } else { "FAIL" },
-            hex(&le_bytes(&compressed)),
+            fnv1a(bytes.iter().copied()),
         )
         .unwrap();
         eprintln!("{label}: {name} n={n} words={} roundtrip={roundtrip_ok} tc_back={tc_back_ok}", compressed.len());

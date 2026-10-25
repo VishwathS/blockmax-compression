@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use crate::{BlockCodec, MAX_VALUE, RandomAccessCodec};
+use crate::{BlockCodec, RandomAccessCodec, check_values};
 
 /// Stores each value as a single byte.
 pub struct Raw;
@@ -15,15 +15,12 @@ impl BlockCodec for Raw {
     const BLOCK_SIZE: usize = 128;
 
     fn encode(input: &[u16], out: &mut Vec<u8>) {
+        // Checked first, in release builds too, so nothing is written for a bad input.
+        // Without it, `as u8` below would silently turn 256 into 0.
+        check_values("Raw", input);
         // We know the exact output size, so grow the buffer once up front.
         out.reserve(input.len());
         for &value in input {
-            // `assert!` (not `debug_assert!`) so release builds check too. Without it,
-            // `as u8` below would silently turn 256 into 0.
-            assert!(
-                value <= MAX_VALUE,
-                "Raw: value {value} is above {MAX_VALUE}"
-            );
             // `as u8` keeps the low 8 bits, which is the whole value when it's <= 255.
             out.push(value as u8);
         }

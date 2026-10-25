@@ -14,7 +14,7 @@
 //! the flag is 0). The remaining bit is `1`, and with the "last" flag set that's 0x81.
 //! So 130 encodes as `[0x02, 0x81]`.
 
-use crate::{BlockCodec, MAX_VALUE};
+use crate::{BlockCodec, MAX_VALUE, check_values};
 
 /// The high bit of a byte: set on the last byte of each number.
 const LAST_BYTE_FLAG: u8 = 0x80;
@@ -28,13 +28,10 @@ impl BlockCodec for VByte {
     const BLOCK_SIZE: usize = 128;
 
     fn encode(input: &[u16], out: &mut Vec<u8>) {
+        // Checked first, in release builds too, so nothing is written for a bad input.
+        // Without it, a value like 20000 would encode as 3 bytes that `decode` rejects.
+        check_values("VByte", input);
         for &value in input {
-            // `assert!` (not `debug_assert!`) so release builds check too. Without it,
-            // a value like 20000 would encode as 3 bytes that `decode` then rejects.
-            assert!(
-                value <= MAX_VALUE,
-                "VByte: value {value} is above {MAX_VALUE}"
-            );
             let mut remaining = value;
             // While more than 7 bits are left, write the low 7 bits with the flag off
             // ("more bytes follow"), then drop those 7 bits. For values <= 255 this

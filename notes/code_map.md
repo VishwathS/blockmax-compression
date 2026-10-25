@@ -150,7 +150,7 @@ For one term (`postings` = list of `(docid, score)`):
 - **`prefetch(compressed, idx)`** (`:368-378`): prefetches the first cache line of the
   group containing `idx`. A group with width `b` spans `b` cache lines on AVX-512
   (32·b u16 = 64·b bytes), so only the first one gets prefetched.
-- **`init` does not reset `current_block`** (found in stage 6, P1 in
+- **`init` does not reset `current_block`** (found in stage 5, P1 in
   `notes/design_decisions.md`). Reproduced with his public API in all three builds
   (`notes/simdbp_oracle_probes.txt`): after `init(B)` on a decompressor whose cached
   group g came from row A, `decompress_block(B, g·BLOCK_SIZE)` returns row A's values.
@@ -182,7 +182,7 @@ Notes:
   So in practice every SIMDBP query, on any machine, goes through `decompress_block`.
   The comment at `:1217` ("decodes more data but faster for safe search") suggests the
   register version was tried and the full-group version won.
-  (Stage 6: the oracle found that `decompress_register` returns a wrong register for
+  (Stage 5: the oracle found that `decompress_register` returns a wrong register for
   width 6, register offset 10 (`single_unpack256_6`), P5 in `notes/design_decisions.md`;
   since the function is never called, no search result is affected.)
 - Hot path summary for the default (non-ablation) search, `repeated_hierarchical_boundsum`
@@ -237,7 +237,7 @@ it needs, like `idx % BLOCK_SIZE` today). `Bp128` also covers item 9: an all-zer
 | `Raw` | `src/raw.rs` | done | always 1.000 | yes, 128-value groups, O(1) locate |
 | `VByte` | `src/vbyte.rs` | done | 1 for 0..=127, 2 for 128..=255 | no |
 | `Bp128` | `src/bp128.rs` | done | 16 × width + 1 bytes per 128 values | yes, 128-value groups, O(g) one-shot / O(1) with `GroupIndex` |
-| `SimdBp128` / `SimdBp256` / `SimdBp512` | `src/simdbp/` | done (stage 6) | Parker's SIMDBP: one 8 × STRIDE-byte header per metablock + 2 × STRIDE × width bytes per group | yes, 128/256/512-value groups, O(g) one-shot / O(1) with `GroupIndex` |
+| `SimdBp128` / `SimdBp256` / `SimdBp512` | `src/simdbp/` | done (stage 5) | Parker's SIMDBP: one 8 × STRIDE-byte header per metablock + 2 × STRIDE × width bytes per group | yes, 128/256/512-value groups, O(g) one-shot / O(1) with `GroupIndex` |
 
 All six are registered in `codecs::Codec` (`src/registry.rs`, see below).
 
@@ -255,7 +255,7 @@ codecs, they are not research results.
 GroupIndex RAM while a row is open (not stored): 0.0625 B/value for 128-value groups
 (Raw, Bp128, SimdBp128), 0.0313 for SimdBp256, 0.0156 for SimdBp512; VByte has none.
 
-Until stage 6 the report encoded every `block_size()` (128) values as a separate row.
+Until stage 5 the report encoded every `block_size()` (128) values as a separate row.
 That gave Raw/VByte/Bp128 exactly the same numbers as one row (they have no per-row
 header; `tests/end_to_end.rs` checks this), but charged SIMDBP a whole metablock header
 per 128 values (all zeros: 0.500 B/value instead of 0.001), so it was changed.
@@ -279,9 +279,11 @@ per 128 values (all zeros: 0.500 B/value instead of 0.001), so it was changed.
   in the "Random access" subsection below, without changing this format.
 
 ### Design decisions and limitations
-- **Range check in every build.** All three `encode`s now `assert!` (not
-  `debug_assert!`) that values are <= 255. Before, a release build silently truncated
-  in `Raw` (256 → 0) and wrote 3-byte values in `VByte` that `decode` rejected.
+- **Range check in every build.** Every `encode` checks (with a real panic, not
+  `debug_assert!`) that all values are <= 255, and since stage 5 it does so **before
+  writing anything** (`check_values` in `src/lib.rs`), so a rejected row leaves the
+  output buffer unchanged (B1 in `notes/design_decisions.md`). Before stage 2, a release
+  build silently truncated in `Raw` (256 → 0) and wrote 3-byte values in `VByte`.
 - **Padding cost.** A short last chunk is padded to 128 values, which costs up to
   127 × width bits. That cost is negligible for long inputs encoded in 128-value pieces,
   but large if a caller encodes many tiny inputs. An alternative is to store the tail
@@ -294,9 +296,9 @@ per 128 values (all zeros: 0.500 B/value instead of 0.001), so it was changed.
   least one value >= 21 and are packed at up to 8 bits. Ideas to test on real data:
   smaller chunks (BitPacker1x, 32 values), PFor-style exceptions, or storing the
   outliers separately. Real block maxes may differ from this synthetic mix, so check on
-  `export_data` output (stage 5) before optimizing.
+  `export_data` output (stage 8) before optimizing.
 
-### Codec registry (`src/registry.rs`, stage 4)
+### Codec registry (`src/registry.rs`, stage 3)
 - `codecs::Codec` is an enum with one variant per codec (`Raw`, `VByte`, `Bp128`,
   `SimdBp128`, `SimdBp256`, `SimdBp512`).
   `Codec::ALL` lists them in report order. `name()` gives the stable display name,
@@ -304,20 +306,20 @@ per 128 values (all zeros: 0.500 B/value instead of 0.001), so it was changed.
   `decode()` forward to the codec type with a `match`. The `BlockCodec` trait and
   every byte format are unchanged; the registry only forwards calls.
 - The size report loops over `Codec::ALL`, so a new codec gets a column automatically.
-  The registry refactor printed byte-for-byte the same report as before (stage 4).
+  The registry refactor printed byte-for-byte the same report as before (stage 3).
 - Adding a codec: implement `BlockCodec`, add a variant + append it to `ALL`, add an arm
   to each `match` (the compiler points out every missing one), and update the expected
   list in `registry_lists_exactly_the_implemented_codecs`.
 
 Open questions for later stages:
 - **Dispatch cost in benchmarks.** The `match` runs once per `encode`/`decode` call
-  (one 128-value block), which should be negligible, but stage 8 should time the hot
+  (one 128-value block), which should be negligible, but stage 9 should time the hot
   decode loop through the generic `C: BlockCodec` path too, to confirm.
 - **Parameterized codecs.** A codec with settings (e.g. Bp with 32- or 512-value chunks,
   or a PFor exception threshold) is a separate type today, so it would be a separate
   variant. If there end up being many such settings, a variant could carry them
   (`Codec::Bp { chunk: usize }`); not needed yet.
-- **SIMDBP and the random-access trait.** Resolved in stage 6 without changing the
+- **SIMDBP and the random-access trait.** Resolved in stage 5 without changing the
   trait: see "SIMDBP codecs" below. `GROUP_LEN = 16 × STRIDE`, `locate_groups` reads the
   4-bit headers and prefix-sums them (what `init` does), and the `Vec<u16>` storage is
   written as little-endian bytes (the same bytes as his `Vec<u16>` in x86 memory).
@@ -386,7 +388,7 @@ re-decoding itself); BitPacker4x's 4-lane layout instead of SIMDBP's STRIDE lane
 
 **Size report.** Unchanged byte for byte by random access (no format changed).
 
-### SIMDBP codecs (`src/simdbp/`, stage 6)
+### SIMDBP codecs (`src/simdbp/`, stage 5)
 
 - `SimdBp<const STRIDE>` with `SimdBp128 = SimdBp<8>`, `SimdBp256 = SimdBp<16>`,
   `SimdBp512 = SimdBp<32>`; any other STRIDE is a compile error. All three are separate
@@ -411,22 +413,55 @@ re-decoding itself); BitPacker4x's 4-lane layout instead of SIMDBP's STRIDE lane
   decoding headers is independent of the code that packed them.
 - **No allocation on decode / random access**: stack buffers (`[u16; 512]` values,
   `[u16; 256]` words). Group bytes are copied into the word buffer (`from_le_bytes`), so
-  any alignment and byte order work; a zero-copy view is a possible stage-8 optimization.
+  any alignment and byte order work; a zero-copy view is a possible stage-9 optimization.
+  The vendored kernels use only unaligned loads/stores (`loadu`/`lddqu`/`storeu`,
+  checked), so the 2-byte-aligned stack buffers are valid inputs.
 - **Verified against Parker's code**: `tools/simdbp_oracle` (separate nightly crate,
   path dependency on his repo, read-only) built 3 times (sse / avx2 / avx512) writes
-  `tests/data/simdbp/simdbp{128,256,512}.txt`: 21 cases each with his `compress` bytes,
-  his `Decompressor` widths and offsets, and hashes of his scalar `transcode` to the other
-  sizes. `tests/simdbp.rs` requires our bytes to be identical (scalar and SIMD kernels),
-  our widths/offsets to equal his, and our other-size encodings to equal his transcodes.
-  See `notes/design_decisions.md` for what this does and doesn't prove, and for the
-  issues the oracle reproduced in his code (stale `Decompressor` cache, AVX2 width-6 bug).
+  `tests/data/simdbp/simdbp{128,256,512}.txt`: 23 cases each with his `compress` output
+  (full bytes when <= 32 KiB, otherwise length + FNV-1a hash), his `Decompressor` widths
+  and offsets, and hashes of his scalar `transcode` to the other sizes. `tests/simdbp.rs`
+  requires our bytes to be identical (scalar and SIMD kernels), our widths/offsets to
+  equal his, and our other-size encodings to equal his transcodes; it also checks that
+  the cases put a nonzero width in every header slot (every word, 4-bit position, and
+  lane) across at least three metablocks. See `notes/design_decisions.md` for what this
+  does and doesn't prove, and for the issues the oracle reproduced in his code (stale
+  `Decompressor` cache, AVX2 width-6 bug).
+- **Which kernel ran** is recorded by a test-only counter (`kernel::trace`, compiled only
+  under `cfg(test)`, so normal and benchmark builds don't contain it); the unit tests in
+  `src/simdbp/kernel_selection_tests.rs` use it to prove a forced kernel and the default
+  `Kernel::best` path really execute the SSE3 / AVX2 / AVX-512 code, and print `SKIPPED`
+  on CPUs without those instructions.
 
-### Next stages (see `CLAUDE.md`)
-Done: 4. codec registry, random access (`RandomAccessCodec` + `GroupIndex` for Raw and
-Bp128), 6. SIMDBP integration (done before 5; `SimdBp128/256/512`, byte-identical to
-Parker's `compress`). Next: 5. real index loader (`export_data` matrices), 7. CLI,
-8. benchmarking (criterion speed + bytes per value on real data; include one-shot vs.
-`GroupIndex` lookup, `GroupIndex` build cost per term, scalar vs SIMD kernels).
+### Test map: what each test file proves
+
+| file | checks | independent of our own decoder? |
+|---|---|---|
+| `tests/simdbp.rs` | SIMDBP vs Parker's golden vectors; hand-computed bytes (incl. header word 1, lanes ≥ 16, second metablock); header-slot coverage; scalar = SIMD kernels; format details; errors | **yes** (Parker's output, hand calculation) for the golden and by-hand tests; the rest are self-consistency |
+| `tests/bp128_layout.rs` | Bp128 bytes vs a model of the BitPacker4x layout written in the test, widths 0..=8, partial chunks, every value 0..=255 | **yes** (independent model; run in debug and release) |
+| `tests/roundtrip.rs` | round trips, VByte/Raw/Bp128 known bytes, range check, registry = direct calls | round trips: no; known bytes: yes |
+| `tests/random_access.rs` | every group one-shot and via `GroupIndex` vs sequential decode; exact Bp128 offsets; errors | mostly no (self-consistency); Bp128 offsets by hand: yes |
+| `tests/contracts.rs` | B1 (buffer unchanged after a rejected value), stale-index regression (P1-style), truncated input, B2 lenient decoding, B3 wrong `n` | pins agreed behavior |
+| `tests/boundaries.rs` | GL² − 1, GL², GL² + 1 rows for every codec, sizes vs an independent formula, scalar = SIMD; opt-in ~8.8M-value stress test (`--ignored`) | sizes: yes; values: self-consistency |
+| `tests/end_to_end.rs` | one 270,001-value row through the registry, sizes computed independently | sizes: yes |
+| `src/simdbp/kernel_selection_tests.rs` | which kernel actually ran | — |
+
+Keep these distinctions in mind when reading results:
+- Byte compatibility with Parker's code does not mean equal speed (see the performance
+  caveat in `notes/design_decisions.md`).
+- Passing tests on synthetic data says nothing about compression on real block maxes.
+- A test that compares our encoder with our decoder doesn't verify the format.
+- A hash match shows agreement for the tested input, not compatibility in general.
+
+### Roadmap (see `CLAUDE.md`)
+Done: 1. Raw + VByte, 2. Bp128, 3. codec registry, 4. random access
+(`RandomAccessCodec` + `GroupIndex`), 5. Parker SIMDBP integration and the correctness
+audit (`SimdBp128/256/512`, byte-identical to Parker's `compress`). Next: 6. seeded
+synthetic data infrastructure, 7. CLI and experiment configuration, 8. real-data
+loading (`export_data` matrices), pending Parker's guidance and data, 9. benchmarking
+methodology and experiments (criterion speed + bytes per value on real data; include
+one-shot vs. `GroupIndex` lookup, `GroupIndex` build cost per term, scalar vs SIMD
+kernels), pending discussion with Parker.
 
 ## (b) Questions to verify yourself (not answered here)
 

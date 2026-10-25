@@ -37,6 +37,16 @@ pub use vbyte::VByte;
 /// The largest value a codec has to handle. Inputs above this break the contract.
 pub const MAX_VALUE: u16 = 255;
 
+/// Panics (in every build) if any value in `input` is above [`MAX_VALUE`], naming the
+/// first bad value. Every encoder calls this **before writing anything**, so a
+/// rejected input leaves the caller's output buffer exactly as it was.
+pub(crate) fn check_values(codec: &str, input: &[u16]) {
+    // `find` stops at the first value above the limit; `None` means all are fine.
+    if let Some(&bad) = input.iter().find(|&&value| value > MAX_VALUE) {
+        panic!("{codec}: value {bad} is above {MAX_VALUE}");
+    }
+}
+
 /// A codec that encodes a block of `u16` values to bytes and decodes them back.
 ///
 /// # Contract
@@ -44,7 +54,8 @@ pub const MAX_VALUE: u16 = 255;
 /// - Every input value is a `u16` that is **at most [`MAX_VALUE`] (255)**. `encode`
 ///   checks this with `assert!` and panics on a bad value, in debug **and** release
 ///   builds. (Encoding happens once, offline, so the check costs nothing at query time,
-///   and a release build never silently writes a wrong value.)
+///   and a release build never silently writes a wrong value.) The check runs before
+///   any byte is written, so after that panic `out` is unchanged.
 /// - `encode(input, out)` appends the encoded bytes to `out`.
 /// - `decode(input, out)` fills `out` and returns how many bytes it consumed.
 ///
@@ -64,7 +75,8 @@ pub trait BlockCodec {
     ///
     /// # Panics
     ///
-    /// Panics if any value in `input` is above `MAX_VALUE` (in every build).
+    /// Panics if any value in `input` is above `MAX_VALUE` (in every build). The check
+    /// happens before anything is appended, so `out` is left unchanged.
     fn encode(input: &[u16], out: &mut Vec<u8>);
 
     /// Decodes exactly `out.len()` values from the start of `input` into `out`.

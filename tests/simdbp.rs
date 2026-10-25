@@ -82,6 +82,31 @@ fn generate(spec: &str, n: usize, gl: usize) -> Vec<u16> {
                 })
                 .collect()
         }
+        "headers" => {
+            let mut rng = XorShift64(num(1));
+            (0..n)
+                .map(|i| {
+                    let r = rng.next();
+                    let g = i / gl;
+                    let w = (g + 3 * (g / gl)) % 9;
+                    let mask = ((1u32 << w) - 1) as u16;
+                    if i % gl == 0 { mask } else { r as u16 & mask }
+                })
+                .collect()
+        }
+        "randgroups" => {
+            let seed = num(1);
+            let mut rng = XorShift64(seed);
+            (0..n)
+                .map(|i| {
+                    let r = rng.next();
+                    let g = (i / gl) as u64;
+                    let w = ((g ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 9;
+                    let mask = ((1u32 << w) - 1) as u16;
+                    if i % gl == 0 { mask } else { r as u16 & mask }
+                })
+                .collect()
+        }
         "blockmax" => {
             let mut rng = XorShift64(num(1));
             (0..n)
@@ -133,11 +158,20 @@ const GOLDEN_256: &str = include_str!("data/simdbp/simdbp256.txt");
 const GOLDEN_512: &str = include_str!("data/simdbp/simdbp512.txt");
 
 /// The kernels to test for `stride` lanes: always the scalar one, plus the SIMD one if
-/// this CPU can run it.
+/// this CPU can run it. If it can't, a SKIPPED line is printed (see it with
+/// `-- --nocapture`), or the test fails when `CODECS_REQUIRE_SIMD=1`. Which kernel
+/// actually runs is proven by the unit tests in `src/simdbp/kernel_selection_tests.rs`.
 fn kernels_for(stride: usize) -> Vec<Kernel> {
     let mut kernels = vec![Kernel::Scalar];
-    if Kernel::best(stride) != Kernel::Scalar {
-        kernels.push(Kernel::best(stride));
+    let simd = Kernel::simd_for_stride(stride).unwrap();
+    if simd.is_available() {
+        kernels.push(simd);
+    } else {
+        assert!(
+            std::env::var("CODECS_REQUIRE_SIMD").as_deref() != Ok("1"),
+            "{simd:?} is required (CODECS_REQUIRE_SIMD=1) but this CPU can't run it"
+        );
+        println!("SKIPPED: {simd:?} (stride {stride}) not supported here; scalar only");
     }
     kernels
 }
@@ -165,7 +199,16 @@ struct GoldenCase {
     offsets: Vec<usize>,
     /// (other group size, its transcode() length in u16, FNV of its bytes)
     transcoded: Vec<(usize, usize, u64)>,
-    bytes: Vec<u8>,
+    /// FNV-1a of his `compress` output bytes (every case).
+    bytes_fnv: u64,
+    /// His `compress` output bytes, for cases small enough to store in full (<= 32 KiB).
+    /// Large cases have only `words` and `bytes_fnv`.
+    bytes: Option<Vec<u8>>,
+}
+
+/// Parses `0x...` as a u64.
+fn hex_u64(s: &str) -> u64 {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).expect("bad hex number")
 }
 
 fn parse_golden(text: &str, expected_block_size: usize) -> Vec<GoldenCase> {
@@ -178,10 +221,12 @@ fn parse_golden(text: &str, expected_block_size: usize) -> Vec<GoldenCase> {
 
     let mut cases = Vec::new();
     for line in text.lines().filter(|l| l.starts_with("case ")) {
-        let field = |key: &str| -> &str {
+        let optional_field = |key: &str| -> Option<&str> {
             line.split(' ')
                 .find_map(|kv| kv.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
-                .unwrap_or_else(|| panic!("missing {key} in {line:.80}"))
+        };
+        let field = |key: &str| -> &str {
+            optional_field(key).unwrap_or_else(|| panic!("missing {key} in {line:.80}"))
         };
         // Parker's own decoder and transcoder must have agreed with his encoder.
         assert_eq!(field("parker_roundtrip"), "ok", "{}", field("name"));
@@ -190,24 +235,26 @@ fn parse_golden(text: &str, expected_block_size: usize) -> Vec<GoldenCase> {
         for other in [128, 256, 512] {
             if other != expected_block_size {
                 let (len, fnv) = field(&format!("tc{other}")).split_once(':').unwrap();
-                let fnv = u64::from_str_radix(fnv.trim_start_matches("0x"), 16).unwrap();
-                transcoded.push((other, len.parse().unwrap(), fnv));
+                transcoded.push((other, len.parse().unwrap(), hex_u64(fnv)));
             }
         }
         cases.push(GoldenCase {
             name: field("name").to_string(),
             n: field("n").parse().unwrap(),
             spec: field("gen").to_string(),
-            input_fnv: u64::from_str_radix(field("input_fnv").trim_start_matches("0x"), 16)
-                .unwrap(),
+            input_fnv: hex_u64(field("input_fnv")),
             words: field("words").parse().unwrap(),
             widths: parse_list(field("widths")),
             offsets: parse_list(field("offsets")),
             transcoded,
-            bytes: from_hex(field("bytes")),
+            bytes_fnv: hex_u64(field("bytes_fnv")),
+            bytes: optional_field("bytes").map(from_hex),
         });
     }
-    assert_eq!(cases.len(), 21, "expected 21 golden cases");
+    assert_eq!(cases.len(), 23, "expected 23 golden cases");
+    // The small cases (every case of the original 21, and more) must have exact bytes.
+    let exact = cases.iter().filter(|c| c.bytes.is_some()).count();
+    assert!(exact >= 21, "only {exact} cases have exact bytes");
     cases
 }
 
@@ -223,43 +270,57 @@ fn check_golden<const S: usize>(text: &str) {
             case.input_fnv,
             "{name}: our generator differs from the oracle's"
         );
-        assert_eq!(
-            case.bytes.len(),
-            2 * case.words,
-            "{name}: golden byte count"
-        );
+        if let Some(his) = &case.bytes {
+            assert_eq!(his.len(), 2 * case.words, "{name}: golden byte count");
+            assert_eq!(fnv1a(his), case.bytes_fnv, "{name}: golden bytes vs hash");
+        }
 
+        // `bytes` = Parker's exact bytes when stored. For a large case only his length
+        // and hash are stored; once our bytes match both, they are used in his place.
+        // (A hash match shows agreement on this input, with a negligible chance of a
+        // coincidence; it is not a byte-by-byte comparison.)
+        let mut bytes = case.bytes.clone();
         for kernel in kernels_for(S) {
-            // 1. Encoding gives exactly Parker's bytes.
+            // 1. Encoding gives exactly Parker's bytes (or his length and hash).
             let mut ours = Vec::new();
             SimdBp::<S>::encode_with(kernel, &input, &mut ours);
-            assert!(
-                ours == case.bytes,
-                "{name} ({kernel:?}): our bytes differ from Parker's (ours {} bytes, his {}; first difference at byte {:?})",
-                ours.len(),
-                case.bytes.len(),
-                ours.iter().zip(&case.bytes).position(|(a, b)| a != b)
-            );
+            match &case.bytes {
+                Some(his) => assert!(
+                    &ours == his,
+                    "{name} ({kernel:?}): our bytes differ from Parker's (ours {} bytes, his {}; first difference at byte {:?})",
+                    ours.len(),
+                    his.len(),
+                    ours.iter().zip(his).position(|(a, b)| a != b)
+                ),
+                None => {
+                    assert_eq!(ours.len(), 2 * case.words, "{name} ({kernel:?}): length");
+                    assert_eq!(
+                        fnv1a(&ours),
+                        case.bytes_fnv,
+                        "{name} ({kernel:?}): hash of our bytes differs from Parker's"
+                    );
+                    bytes.get_or_insert(ours);
+                }
+            }
+        }
+        let bytes = bytes.expect("set above");
 
+        for kernel in kernels_for(S) {
             // 2. Decoding Parker's bytes gives the input and consumes all of them.
             let mut decoded = vec![0u16; case.n];
-            let used = SimdBp::<S>::decode_with(kernel, &case.bytes, &mut decoded);
+            let used = SimdBp::<S>::decode_with(kernel, &bytes, &mut decoded);
             assert_eq!(decoded, input, "{name} ({kernel:?}): decoding his bytes");
-            assert_eq!(
-                used,
-                case.bytes.len(),
-                "{name} ({kernel:?}): bytes consumed"
-            );
+            assert_eq!(used, bytes.len(), "{name} ({kernel:?}): bytes consumed");
         }
 
         // 3. Our view of the headers matches his Decompressor after `init`.
         let n_groups = SimdBp::<S>::num_groups(case.n);
         assert_eq!(case.widths.len(), n_groups, "{name}");
         let mut index = GroupIndex::<SimdBp<S>>::new();
-        index.build(&case.bytes, case.n);
+        index.build(&bytes, case.n);
         for g in 0..n_groups {
             assert_eq!(
-                SimdBp::<S>::group_width(&case.bytes, case.n, g),
+                SimdBp::<S>::group_width(&bytes, case.n, g),
                 case.widths[g],
                 "{name}: width of group {g}"
             );
@@ -271,15 +332,19 @@ fn check_golden<const S: usize>(text: &str) {
                 "{name}: start of group {g}"
             );
         }
-        assert_eq!(index.encoded_len(), case.bytes.len(), "{name}");
+        assert_eq!(index.encoded_len(), bytes.len(), "{name}");
 
-        // 4. Random access into his bytes: every group, one-shot and indexed.
+        // 4. Random access into his bytes: every group, indexed, and one-shot for up to
+        //    600 groups (one-shot is O(g) per group, so every group of the largest
+        //    case would be slow in debug builds; the index covers all of them).
         let mut out = vec![0u16; gl];
         for g in 0..n_groups {
             let expected = &input[g * gl..((g + 1) * gl).min(case.n)];
-            let len = SimdBp::<S>::decode_group(&case.bytes, case.n, g, &mut out);
-            assert_eq!(&out[..len], expected, "{name}: group {g} (one-shot)");
-            let len = index.decode_group(&case.bytes, g, &mut out);
+            if g < 300 || g + 300 >= n_groups {
+                let len = SimdBp::<S>::decode_group(&bytes, case.n, g, &mut out);
+                assert_eq!(&out[..len], expected, "{name}: group {g} (one-shot)");
+            }
+            let len = index.decode_group(&bytes, g, &mut out);
             assert_eq!(&out[..len], expected, "{name}: group {g} (index)");
         }
 
@@ -314,6 +379,50 @@ fn simdbp256_matches_parkers_avx2_build() {
 #[test]
 fn simdbp512_matches_parkers_avx512_build() {
     check_golden::<32>(GOLDEN_512);
+}
+
+/// The golden cases must exercise every header field of a metablock: each of the GL
+/// slots (so every header word, every 4-bit position in a word, and every lane) holds a
+/// nonzero width in some case, and nonzero fields appear in at least three metablocks.
+/// This is checked from Parker's own widths (`Decompressor.offsets`), so it measures
+/// what his code was compared on, not what our code reads.
+fn check_header_coverage<const S: usize>(text: &str) {
+    let gl = 16 * S;
+    let mut slot_seen = vec![false; gl];
+    let mut metablocks_seen = std::collections::BTreeSet::new();
+    for case in parse_golden(text, gl) {
+        for (g, &width) in case.widths.iter().enumerate() {
+            if width > 0 {
+                slot_seen[g % gl] = true;
+                metablocks_seen.insert(g / gl);
+            }
+        }
+    }
+    let missing: Vec<usize> = (0..gl).filter(|&slot| !slot_seen[slot]).collect();
+    assert!(
+        missing.is_empty(),
+        "GL={gl}: header slots never nonzero: {missing:?}"
+    );
+    // Slot s = lane s % S, field j = s / S, header word j / 4, bit position 4 × (j % 4).
+    // All slots seen implies all of these; spell it out for the report.
+    for word in 0..4 {
+        for position in 0..4 {
+            for lane in 0..S {
+                assert!(slot_seen[(4 * word + position) * S + lane]);
+            }
+        }
+    }
+    assert!(
+        metablocks_seen.len() >= 3,
+        "GL={gl}: nonzero widths only in metablocks {metablocks_seen:?}"
+    );
+}
+
+#[test]
+fn golden_cases_cover_every_header_field() {
+    check_header_coverage::<8>(GOLDEN_128);
+    check_header_coverage::<16>(GOLDEN_256);
+    check_header_coverage::<32>(GOLDEN_512);
 }
 
 // ---------- hand-computed bytes (independent of Parker's code and of ours) ----------
@@ -361,6 +470,70 @@ fn simdbp128_header_field_position_by_hand() {
     assert_eq!(SimdBp128::group_width(&out, input.len(), 17), 3);
     // Value 0 of group 17 (= 5) is lane 0, bits 0..3 → data word 0 = 5.
     assert_eq!(&out[64..66], &[5, 0]);
+}
+
+#[test]
+fn simdbp256_header_word_1_by_hand() {
+    // GL = 256, STRIDE = 16, header = 4 × 16 words = 128 bytes. Only group 93 is
+    // nonzero: its value 0 is 5 (max 5 → width 3).
+    // Header: slot 93 = lane 93 % 16 = 13, field j = 93 / 16 = 5 → header word
+    // j / 4 = 1 of lane 13 = word 1 × 16 + 13 = 29 (bytes 58..60), at bit 4 × (5 % 4) = 4
+    // → word 29 = 3 << 4 = 0x0030.
+    // Data: groups 0..93 have width 0 (no bytes), so group 93 starts right after the
+    // header, at byte 128. Value 0 = lane 0, bits 0..3 → data word 0 = 5.
+    // Size: 128 + 2 × 16 × 3 = 224 bytes.
+    let mut input = vec![0u16; 94 * 256];
+    input[93 * 256] = 5;
+    let mut expected = vec![0u8; 224];
+    expected[58] = 0x30;
+    expected[128] = 5;
+    let mut out = Vec::new();
+    SimdBp256::encode(&input, &mut out);
+    assert_eq!(out, expected);
+    assert_eq!(SimdBp256::group_width(&out, input.len(), 93), 3);
+}
+
+#[test]
+fn simdbp512_high_lane_and_header_word_1_by_hand() {
+    // GL = 512, STRIDE = 32, header = 4 × 32 words = 256 bytes. Only group 219 is
+    // nonzero: its value 59 is 100 (0b110_0100, width 7).
+    // Header: slot 219 = lane 219 % 32 = 27, field j = 219 / 32 = 6 → header word
+    // j / 4 = 1 of lane 27 = word 1 × 32 + 27 = 59 (bytes 118..120), at bit
+    // 4 × (6 % 4) = 8 → word 59 = 7 << 8 = 0x0700 → byte 118 = 0x00, byte 119 = 0x07.
+    // Data starts at byte 256 (all earlier groups are width 0). Value 59 = lane
+    // 59 % 32 = 27, entry 59 / 32 = 1 → bits 7..14 of lane 27's stream → lane 27's
+    // word 0 = data word 0 × 32 + 27 = 27 (bytes 256 + 54 = 310..312), holding
+    // 100 << 7 = 12800 = 0x3200 → byte 310 = 0x00, byte 311 = 0x32.
+    // Size: 256 + 2 × 32 × 7 = 704 bytes.
+    let mut input = vec![0u16; 220 * 512];
+    input[219 * 512 + 59] = 100;
+    let mut expected = vec![0u8; 704];
+    expected[119] = 0x07;
+    expected[311] = 0x32;
+    let mut out = Vec::new();
+    SimdBp512::encode(&input, &mut out);
+    assert_eq!(out, expected);
+    assert_eq!(SimdBp512::group_width(&out, input.len(), 219), 7);
+}
+
+#[test]
+fn simdbp128_second_metablock_header_by_hand() {
+    // GL = 128, STRIDE = 8, header = 64 bytes; 174 groups → 2 metablocks → 2 headers
+    // (128 bytes). Only group 173 is nonzero: its value 0 is 3 (width 2).
+    // Group 173 = metablock 1, slot 45 = lane 45 % 8 = 5, field j = 45 / 8 = 5 → word
+    // j / 4 = 1 of lane 5 = word 1 × 8 + 5 = 13 of header 1, at bit 4 × (5 % 4) = 4.
+    // Header 1 starts at byte 64, so word 13 is bytes 64 + 26 = 90..92 → 2 << 4 = 0x20.
+    // Data starts after both headers, at byte 128: value 0 → data word 0 = 3.
+    // Size: 128 + 2 × 8 × 2 = 160 bytes.
+    let mut input = vec![0u16; 174 * 128];
+    input[173 * 128] = 3;
+    let mut expected = vec![0u8; 160];
+    expected[90] = 0x20;
+    expected[128] = 3;
+    let mut out = Vec::new();
+    SimdBp128::encode(&input, &mut out);
+    assert_eq!(out, expected);
+    assert_eq!(SimdBp128::group_width(&out, input.len(), 173), 2);
 }
 
 #[test]

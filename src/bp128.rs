@@ -34,7 +34,7 @@ use std::ops::Range;
 
 use bitpacking::{BitPacker, BitPacker4x};
 
-use crate::{BlockCodec, MAX_VALUE, RandomAccessCodec};
+use crate::{BlockCodec, RandomAccessCodec, check_values};
 
 /// Values per chunk. `BitPacker4x` always packs exactly this many (128).
 const CHUNK_LEN: usize = BitPacker4x::BLOCK_LEN;
@@ -56,6 +56,10 @@ impl BlockCodec for Bp128 {
 
     fn encode(input: &[u16], out: &mut Vec<u8>) {
         // `new()` picks the fastest implementation this CPU supports. It's cheap.
+        // Checked first, in release builds too, so nothing is written for a bad input:
+        // a value above 255 would need more than 8 bits and would break the "width
+        // fits in 0..=8" rule of the format.
+        check_values("Bp128", input);
         let packer = BitPacker4x::new();
 
         // Part 1: one width byte per chunk. `chunks` gives full 128-value slices and
@@ -64,11 +68,7 @@ impl BlockCodec for Bp128 {
             .chunks(CHUNK_LEN)
             .map(|chunk| {
                 // `chunks` never yields an empty slice, so `max()` always finds a value.
-                let max = chunk.iter().copied().max().unwrap_or(0);
-                // Checked in release builds too: a value above 255 would need more than
-                // 8 bits and would break the "width fits in 0..=8" rule of the format.
-                assert!(max <= MAX_VALUE, "Bp128: value {max} is above {MAX_VALUE}");
-                bit_width(max)
+                bit_width(chunk.iter().copied().max().unwrap_or(0))
             })
             .collect();
         out.extend_from_slice(&widths);

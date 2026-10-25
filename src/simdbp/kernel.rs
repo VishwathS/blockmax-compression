@@ -115,6 +115,9 @@ impl Kernel {
             "SimdBp: a value doesn't fit in {width} bits"
         );
         self.check_runnable(stride);
+        // Test builds only: note that `self` is the kernel the `match` below runs.
+        #[cfg(test)]
+        trace::record(self, trace::Op::Pack);
         match self {
             Kernel::Scalar => pack_scalar(input, stride, width, output),
             // SAFETY (all three arms): `check_runnable` confirmed this kernel's stride
@@ -143,6 +146,8 @@ impl Kernel {
         // `check_args` takes (values, words); for unpack the values are the output.
         check_args(stride, width, output.len(), input.len(), "unpack");
         self.check_runnable(stride);
+        #[cfg(test)]
+        trace::record(self, trace::Op::Unpack);
         match self {
             Kernel::Scalar => unpack_scalar(input, stride, width, output),
             // SAFETY: same as in `pack`.
@@ -244,5 +249,57 @@ fn unpack_scalar(input: &[u16], stride: usize, width: usize, output: &mut [u16])
             }
             output[lane + j * stride] = (value & mask) as u16;
         }
+    }
+}
+
+/// Records which kernel really ran, so tests can prove a SIMD kernel was executed (not
+/// just compiled) and that forcing a kernel works. Compiled only into this crate's own
+/// unit tests (`cfg(test)`); normal and benchmark builds don't contain it at all.
+#[cfg(test)]
+pub(crate) mod trace {
+    use std::cell::Cell;
+
+    use super::Kernel;
+
+    /// Which operation a call was.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Op {
+        Pack,
+        Unpack,
+    }
+
+    /// How many groups (or headers) each kernel packed and unpacked, in the order of
+    /// [`Kernel::ALL`] (Scalar, Sse3, Avx2, Avx512).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Calls {
+        pub(crate) pack: [usize; 4],
+        pub(crate) unpack: [usize; 4],
+    }
+
+    thread_local! {
+        // One counter per thread: the test harness runs tests on several threads at
+        // once, and each test must only see its own calls.
+        static CALLS: Cell<Calls> = Cell::new(Calls::default());
+    }
+
+    /// Position of `kernel` in `Kernel::ALL`.
+    pub(crate) fn slot(kernel: Kernel) -> usize {
+        Kernel::ALL.iter().position(|&k| k == kernel).unwrap()
+    }
+
+    pub(super) fn record(kernel: Kernel, op: Op) {
+        CALLS.with(|cell| {
+            let mut calls = cell.get();
+            match op {
+                Op::Pack => calls.pack[slot(kernel)] += 1,
+                Op::Unpack => calls.unpack[slot(kernel)] += 1,
+            }
+            cell.set(calls);
+        });
+    }
+
+    /// The counts recorded on this thread so far; resets them to zero.
+    pub(crate) fn take() -> Calls {
+        CALLS.with(|cell| cell.replace(Calls::default()))
     }
 }

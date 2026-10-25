@@ -65,9 +65,11 @@
 
 use std::ops::Range;
 
-use crate::{BlockCodec, MAX_VALUE, RandomAccessCodec};
+use crate::{BlockCodec, RandomAccessCodec, check_values};
 
 mod kernel;
+#[cfg(test)]
+mod kernel_selection_tests;
 #[cfg(target_arch = "x86_64")]
 mod kernels;
 
@@ -142,6 +144,10 @@ impl<const STRIDE: usize> SimdBp<STRIDE> {
     pub fn encode_with(kernel: Kernel, input: &[u16], out: &mut Vec<u8>) {
         let () = Self::VALID_STRIDE;
         let gl = Self::GL;
+        // Checked first, in release builds too, so nothing (not even the header space)
+        // is written for a bad input. Parker's code would silently store a value above
+        // 255 at width 8 and lose its high bits.
+        check_values("SimdBp", input);
         if input.is_empty() {
             return; // our extension: an empty row is zero bytes
         }
@@ -161,11 +167,8 @@ impl<const STRIDE: usize> SimdBp<STRIDE> {
         for (metablock, metablock_values) in input.chunks(gl * gl).enumerate() {
             widths.fill(0); // slots past the last group stay 0, as in Parker's code
             for (slot, group) in metablock_values.chunks(gl).enumerate() {
-                let max = group.iter().copied().max().unwrap_or(0);
-                // Checked in release builds too. Parker's code would silently store a
-                // value above 255 at width 8 and lose its high bits.
-                assert!(max <= MAX_VALUE, "SimdBp: value {max} is above {MAX_VALUE}");
-                let width = bit_width(max);
+                // <= 255 (checked above), so the width is at most 8.
+                let width = bit_width(group.iter().copied().max().unwrap_or(0));
                 widths[slot] = width as u16;
 
                 // Zero-pad a short last group to GL values, like Parker's `compress`.
