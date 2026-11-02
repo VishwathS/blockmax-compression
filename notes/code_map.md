@@ -486,3 +486,13 @@ kernels), pending discussion with Parker.
 5. **The ASC leftovers.** At `live_block.rs:726`, the loop runs up to
    `query_range_maxs[0].len()`. Is that the number of block maxes or the length of the
    compressed `Vec<u16>`? What would happen with each?
+
+## (d) Real-data loader (stage 8, branch `feature/grid-loader`)
+
+| file | what it does | independent of our own decoder? |
+|---|---|---|
+| `src/grid.rs` | `Grid`: read-only `memmap2` view of an `export_data` grid (`u32 n_terms`, `u32 n_blocks`, u8 T×C rows); the header is checked against the file length (`8 + T × C`) before any row is read; errors are `Result`s, not panics. `release_row` drops a finished row's pages (plus 2 MiB behind it, because Linux fault-around maps a 64 KiB window) so streaming a 31 GB grid keeps RSS at a few MB. `QueryTerms` parses `._queries.bin` (must be consumed exactly). `assign_strata` (S0 = empty, S1-S4 = quartiles of nonzero superblocks). `size_scan`: every row × every codec, round trip checked. | header/length checks and the query parser: yes. `size_scan` round trips: no (our encoder vs our decoder; SIMDBP bytes are pinned to Parker's by `tests/simdbp.rs`). |
+| `examples/grid_bench.rs` | CLI. `--mode size`: whole-grid exact totals overall/per stratum + Raw + "nonzero × 1 B" reference. `--mode speed`: stratified sample + top terms + query terms (weighted by #queries), 1 warm-up + median of N, reports which SIMDBP kernel ran. Refuses to overwrite outputs. | n/a |
+| `tests/grid.rs` | synthetic grids in `target/tmp` (exact rows after `release_row`, wrong length rejected, `size_scan` bytes = direct `encode` lengths, stratum totals add up); smoke grid end-to-end (shapes 15,572 × 455 / 29; **every superblock max = max of its 16 block maxes**, a codec-independent check of the two export files; every row round-trips; 6,980 queries, all term ids valid). Missing smoke files → SKIPPED unless `GRID_SMOKE_REQUIRE=1`. | the superblock/block consistency check and the shape checks: yes. |
+
+On nairobi (AVX2, no AVX-512): `Kernel::best` gives SimdBp128 → SSE3, SimdBp256 → AVX2, **SimdBp512 → Scalar**, so SimdBp512 timings there are scalar-code timings, not AVX-512.

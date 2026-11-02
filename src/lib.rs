@@ -20,6 +20,7 @@
 //! [`simdbp`] module), so his index's bytes can be compared with the other codecs.
 
 pub mod bp128;
+pub mod grid;
 pub mod random_access;
 pub mod raw;
 pub mod registry;

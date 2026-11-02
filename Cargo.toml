@@ -5,10 +5,16 @@ edition = "2024"
 
 [dependencies]
 bitpacking = "0.9.3"
+memmap2 = "0.9.12"
 
 # `test = true` makes `cargo test` also run the unit tests inside this example.
 [[example]]
 name = "size_report"
+test = true
+
+# Real-data loader CLI: `cargo run --release --example grid_bench -- --help`.
+[[example]]
+name = "grid_bench"
 test = true
 
 [dev-dependencies]
