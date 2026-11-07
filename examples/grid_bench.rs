@@ -1,7 +1,7 @@
 //! Real-data loader: runs every registry codec on the block-max grids written by
 //! Parker's `export_data` (`<prefix>._blocks.bin` / `._superblocks.bin`).
 //!
-//! Two modes:
+//! Three modes:
 //!
 //! - `--mode size`: encodes EVERY row of the grid with every codec, checks every round
 //!   trip, and reports exact whole-grid totals overall and per frequency stratum, plus
@@ -12,6 +12,10 @@
 //!   (weighted by how many queries use them). Median of `--reps` timed runs after one
 //!   warm-up, per row and codec. Run it pinned to one P-core thread:
 //!   `taskset -c 2 nice -n 10 target/release/examples/grid_bench --mode speed ...`
+//! - `--mode stats`: distribution statistics of EVERY row (value histogram, zero runs,
+//!   gaps between nonzeros, nonzeros per 128/256/512 group) and analytic size
+//!   ESTIMATES for sparse formats (see `codecs::stats`). Streams one row at a time;
+//!   the SimdBp128 numbers of every row are checked against the real encoder.
 //!
 //! Strata: each term's stratum comes from its number of nonzero entries in the
 //! SUPERBLOCKS grid (so a term is in the same stratum whichever grid is measured):
@@ -20,6 +24,7 @@
 //! Outputs (never overwritten; the program refuses to start if any exists):
 //!   size:  <out>_size_totals.csv, <out>_size_per_term.csv, <out>_size.md
 //!   speed: <out>_speed_rows.csv, <out>_speed_summary.csv, <out>_speed.md
+//!   stats: <out>_stats.md, <out>_stats_{values,runs,groups,estimates,per_term}.csv
 //!
 //! Build: `cargo build --release --example grid_bench`
 //! (timings from a debug build are meaningless; the program warns if it is one).
@@ -39,9 +44,10 @@ use codecs::grid::{
     size_scan,
 };
 use codecs::simdbp::Kernel;
+use codecs::stats::{Stats, StatsScan, bucket_range, stats_scan};
 
 const USAGE: &str = "\
-grid_bench --mode size|speed --grid <._blocks.bin|._superblocks.bin> --out <prefix> [options]
+grid_bench --mode size|speed|stats --grid <._blocks.bin|._superblocks.bin> --out <prefix> [options]
 
   --strata-grid <path>   grid used to assign strata (default: the ._superblocks.bin
                          next to --grid)
@@ -72,6 +78,7 @@ struct Opts {
 enum Mode {
     Size,
     Speed,
+    Stats,
 }
 
 /// Replaces the `._blocks.bin` / `._superblocks.bin` ending of a grid path with
@@ -110,7 +117,12 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mode = match take("mode").as_deref() {
         Some("size") => Mode::Size,
         Some("speed") => Mode::Speed,
-        Some(other) => return Err(format!("--mode must be size or speed, not {other:?}")),
+        Some("stats") => Mode::Stats,
+        Some(other) => {
+            return Err(format!(
+                "--mode must be size, speed or stats, not {other:?}"
+            ));
+        }
         None => return Err("--mode is required".into()),
     };
     let grid = PathBuf::from(take("grid").ok_or("--grid is required")?);
@@ -800,6 +812,429 @@ fn run_speed(opts: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+// ------------------------------------------------------------------------------------
+// stats mode
+// ------------------------------------------------------------------------------------
+
+/// `100 × a / b`, or 0 when `b` is 0.
+fn pct(a: f64, b: f64) -> f64 {
+    if b > 0.0 { 100.0 * a / b } else { 0.0 }
+}
+
+/// Median nonzero value (lower median) from a value histogram; 0 if there is none.
+fn median_nonzero(hist: &[u64; 256]) -> u8 {
+    let total: u64 = hist[1..].iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (v, &c) in hist.iter().enumerate().skip(1) {
+        seen += c;
+        if 2 * seen >= total {
+            return v as u8;
+        }
+    }
+    255
+}
+
+/// The bucket holding the median of a power-of-2 histogram, as "lo–hi".
+fn median_bucket(hist: &[u64]) -> String {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return "n/a".into();
+    }
+    let mut seen = 0;
+    for (k, &c) in hist.iter().enumerate() {
+        seen += c;
+        if 2 * seen >= total {
+            let (lo, hi) = bucket_range(k);
+            return if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}–{hi}")
+            };
+        }
+    }
+    "n/a".into()
+}
+
+/// The named size items reported per group of rows: (name, bytes as f64).
+/// Header parts are counted in bits (4 per group), so they can be half bytes.
+fn estimate_items(s: &Stats) -> Vec<(&'static str, f64)> {
+    let e = &s.est;
+    vec![
+        ("SimdBp128 (actual codec)", e.sb128_bytes as f64),
+        (
+            "  headers: fields of all-zero groups",
+            e.sb128_header_bits_zero_groups as f64 / 8.0,
+        ),
+        (
+            "  headers: fields of non-empty groups",
+            e.sb128_header_bits_nonempty as f64 / 8.0,
+        ),
+        (
+            "  headers: unused slots (last header)",
+            e.sb128_header_bits_unused as f64 / 8.0,
+        ),
+        ("  data: all non-empty groups", e.sb128_data_bytes as f64),
+        (
+            "  data: groups with 1 nonzero",
+            e.sb128_data_bytes_by_nnz[1] as f64,
+        ),
+        (
+            "  data: groups with 2 nonzeros",
+            e.sb128_data_bytes_by_nnz[2] as f64,
+        ),
+        ("ESTIMATE (ii) position + value", e.posval_bytes as f64),
+        (
+            "ESTIMATE (iii) zero-group bitmap + SimdBp128",
+            e.bitmap_bytes() as f64,
+        ),
+        ("  bitmap part", e.bitmap_bitmap_bytes as f64),
+        (
+            "  SimdBp128 on non-empty groups",
+            e.bitmap_simdbp_bytes as f64,
+        ),
+        ("nonzero × 1 B (reference)", s.nonzero as f64),
+    ]
+}
+
+fn run_stats(opts: &Opts) -> Result<(), String> {
+    let md = out_path(&opts.out, "_stats.md");
+    let values_csv = out_path(&opts.out, "_stats_values.csv");
+    let runs_csv = out_path(&opts.out, "_stats_runs.csv");
+    let groups_csv = out_path(&opts.out, "_stats_groups.csv");
+    let est_csv = out_path(&opts.out, "_stats_estimates.csv");
+    let per_term_csv = out_path(&opts.out, "_stats_per_term.csv");
+    check_outputs(&[
+        md.clone(),
+        values_csv.clone(),
+        runs_csv.clone(),
+        groups_csv.clone(),
+        est_csv.clone(),
+        per_term_csv.clone(),
+    ])?;
+
+    let grid = Grid::open(&opts.grid).map_err(|e| e.to_string())?;
+    let (strata, _sb_nonzero, q) = load_strata(opts, grid.n_terms())?;
+
+    // ---- the scan: one row at a time, per-term line written as we go ----
+    let mut per_term = create_new(&per_term_csv)?;
+    writeln!(per_term, "term,stratum,n_values,nonzero,max,groups_128,zero_groups_128,groups_128_nnz1,groups_128_nnz2,simdbp128_bytes,posval_bytes,bitmap_bytes")
+        .map_err(|e| e.to_string())?;
+    let start = Instant::now();
+    let n_terms = grid.n_terms();
+    let mut io_error = None;
+    let scan: StatsScan = stats_scan(&grid, &strata, |term, stratum, r| {
+        if let Err(e) = writeln!(
+            per_term,
+            "{term},{stratum},{},{},{},{},{},{},{},{},{},{}",
+            r.n_values,
+            r.nonzero,
+            r.max,
+            r.groups_128,
+            r.zero_groups_128,
+            r.groups_128_nnz1,
+            r.groups_128_nnz2,
+            r.sb128_bytes,
+            r.posval_bytes,
+            r.bitmap_bitmap_bytes + r.bitmap_simdbp_bytes
+        ) {
+            io_error.get_or_insert(e);
+        }
+        let done = term + 1;
+        if done.is_multiple_of(1000) || done == n_terms {
+            let secs = start.elapsed().as_secs_f64();
+            let eta = secs / done as f64 * (n_terms - done) as f64;
+            eprintln!("  {done}/{n_terms} rows, {secs:.0} s elapsed, ~{eta:.0} s left");
+        }
+    });
+    if let Some(e) = io_error {
+        return Err(format!("writing {}: {e}", per_term_csv.display()));
+    }
+    per_term.flush().map_err(|e| e.to_string())?;
+    let secs = start.elapsed().as_secs_f64();
+
+    // Groups of rows reported everywhere: the whole grid, then each stratum.
+    let mut groups: Vec<(&str, &Stats)> = vec![("ALL", &scan.overall)];
+    for (i, s) in scan.per_stratum.iter().enumerate() {
+        groups.push((STRATUM_NAMES[i], s));
+    }
+    let werr = |e: std::io::Error| e.to_string();
+
+    // ---- CSVs (long format: one line per number) ----
+    let mut c = create_new(&values_csv)?;
+    writeln!(c, "group,value,count").map_err(werr)?;
+    for (name, s) in &groups {
+        for (v, &n) in s.value_hist.iter().enumerate() {
+            writeln!(c, "{name},{v},{n}").map_err(werr)?;
+        }
+    }
+    c.flush().map_err(werr)?;
+
+    let mut c = create_new(&runs_csv)?;
+    writeln!(c, "group,kind,bucket,len_lo,len_hi,count").map_err(werr)?;
+    for (name, s) in &groups {
+        for (kind, hist) in [("zero_run", &s.zero_run_hist), ("gap", &s.gap_hist)] {
+            for (k, &n) in hist.iter().enumerate() {
+                if n > 0 {
+                    let (lo, hi) = bucket_range(k);
+                    writeln!(c, "{name},{kind},{k},{lo},{hi},{n}").map_err(werr)?;
+                }
+            }
+        }
+    }
+    c.flush().map_err(werr)?;
+
+    let mut c = create_new(&groups_csv)?;
+    writeln!(c, "group,group_len,nonzeros_in_group,count").map_err(werr)?;
+    for (name, s) in &groups {
+        for g in &s.groups {
+            for (k, &n) in g.nnz_hist.iter().enumerate() {
+                if n > 0 {
+                    writeln!(c, "{name},{},{k},{n}", g.group_len).map_err(werr)?;
+                }
+            }
+        }
+    }
+    c.flush().map_err(werr)?;
+
+    let mut c = create_new(&est_csv)?;
+    writeln!(c, "group,item,bytes,pct_of_raw,bits_per_nonzero").map_err(werr)?;
+    for (name, s) in &groups {
+        for (item, b) in estimate_items(s) {
+            writeln!(
+                c,
+                "{name},{},{b:.1},{:.4},{:.3}",
+                item.trim(),
+                pct(b, s.values as f64),
+                if s.nonzero > 0 {
+                    8.0 * b / s.nonzero as f64
+                } else {
+                    0.0
+                }
+            )
+            .map_err(werr)?;
+        }
+    }
+    c.flush().map_err(werr)?;
+
+    // ---- Markdown report ----
+    let mut m = String::new();
+    let o = &scan.overall;
+    let _ = writeln!(
+        m,
+        "# Distribution stats: every row of `{}`\n",
+        opts.grid.display()
+    );
+    m.push_str(&run_info(opts, &grid));
+    m.push_str(&strata_info(&strata, &q));
+    let _ = writeln!(
+        m,
+        "- every row's SimdBp128 bytes (and the bitmap estimate's SimdBp128 part) checked against the real encoder: yes, {} rows",
+        o.rows
+    );
+    let _ = writeln!(m, "- scan time: {secs:.1} s (single thread)");
+    let _ = writeln!(
+        m,
+        "- whole grid: {} rows × {} values = {} values, {} nonzero ({:.3}%)\n",
+        o.rows,
+        grid.n_blocks(),
+        o.values,
+        o.nonzero,
+        pct(o.nonzero as f64, o.values as f64)
+    );
+
+    let _ = writeln!(m, "## 1. Nonzero values\n");
+    let _ = writeln!(
+        m,
+        "Bit width = bits needed to store the value (1 → 1, 2–3 → 2, …, 128–255 → 8). Columns w1–w8: % of nonzero entries.\n"
+    );
+    let _ = writeln!(
+        m,
+        "| group | rows | nonzero % | mean | median | w1 | w2 | w3 | w4 | w5 | w6 | w7 | w8 |"
+    );
+    let _ = writeln!(
+        m,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for (name, s) in &groups {
+        let nz = s.nonzero as f64;
+        let sum: f64 = s
+            .value_hist
+            .iter()
+            .enumerate()
+            .map(|(v, &c)| v as f64 * c as f64)
+            .sum();
+        let mut widths = [0u64; 9];
+        for (v, &c) in s.value_hist.iter().enumerate().skip(1) {
+            widths[codecs::stats::bit_width(v as u8) as usize] += c;
+        }
+        let w: Vec<String> = (1..=8)
+            .map(|k| format!("{:.1}", pct(widths[k] as f64, nz)))
+            .collect();
+        let _ = writeln!(
+            m,
+            "| {name} | {} | {:.3} | {:.1} | {} | {} |",
+            s.rows,
+            pct(nz, s.values as f64),
+            if nz > 0.0 { sum / nz } else { 0.0 },
+            median_nonzero(&s.value_hist),
+            w.join(" | ")
+        );
+    }
+
+    let _ = writeln!(m, "\n## 2. Zero runs and gaps\n");
+    let _ = writeln!(
+        m,
+        "Zero run = maximal stretch of zeros (including at the start/end of a row; an all-zero row is one run). Gap = distance between consecutive nonzeros (adjacent = 1).\n"
+    );
+    let _ = writeln!(m, "Whole grid, by length:\n");
+    let _ = writeln!(m, "| length | zero runs | % of runs | gaps | % of gaps |");
+    let _ = writeln!(m, "|---|---:|---:|---:|---:|");
+    let (runs, gaps) = (o.zero_runs() as f64, o.gaps() as f64);
+    for k in 0..o.zero_run_hist.len() {
+        let (r, g) = (o.zero_run_hist[k], o.gap_hist[k]);
+        if r == 0 && g == 0 {
+            continue;
+        }
+        let (lo, hi) = bucket_range(k);
+        let label = if lo == hi {
+            format!("{lo}")
+        } else {
+            format!("{lo}–{hi}")
+        };
+        let _ = writeln!(
+            m,
+            "| {label} | {r} | {:.2} | {g} | {:.2} |",
+            pct(r as f64, runs),
+            pct(g as f64, gaps)
+        );
+    }
+    let _ = writeln!(m, "\nPer stratum:\n");
+    let _ = writeln!(
+        m,
+        "| group | zero runs | mean run length | median run | gaps | gap = 1 % | gap ≤ 7 % | median gap |"
+    );
+    let _ = writeln!(m, "|---|---:|---:|---|---:|---:|---:|---|");
+    for (name, s) in &groups {
+        let (r, g) = (s.zero_runs(), s.gaps());
+        let le7: u64 = s.gap_hist[..3].iter().sum();
+        let _ = writeln!(
+            m,
+            "| {name} | {r} | {:.1} | {} | {g} | {:.2} | {:.2} | {} |",
+            if r > 0 {
+                s.zero_run_total as f64 / r as f64
+            } else {
+                0.0
+            },
+            median_bucket(&s.zero_run_hist),
+            pct(s.gap_hist[0] as f64, g as f64),
+            pct(le7 as f64, g as f64),
+            median_bucket(&s.gap_hist)
+        );
+    }
+
+    let _ = writeln!(m, "\n## 3. Groups of 128 / 256 / 512 values\n");
+    let _ = writeln!(
+        m,
+        "Groups are aligned at 0 (the last one in a row may be shorter). The nz columns are % of NON-EMPTY groups.\n"
+    );
+    let _ = writeln!(
+        m,
+        "| group | G | groups | all-zero % | non-empty | 1 nz % | 2 nz % | 1–2 nz % | ≤ 4 nz % | ≤ 16 nz % | mean nz / non-empty |"
+    );
+    let _ = writeln!(m, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (name, s) in &groups {
+        for g in &s.groups {
+            let ne = g.nonempty_groups() as f64;
+            let _ = writeln!(
+                m,
+                "| {name} | {} | {} | {:.2} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+                g.group_len,
+                g.groups(),
+                pct(g.zero_groups() as f64, g.groups() as f64),
+                g.nonempty_groups(),
+                pct(g.nonempty_with(1, 1) as f64, ne),
+                pct(g.nonempty_with(2, 2) as f64, ne),
+                pct(g.nonempty_with(1, 2) as f64, ne),
+                pct(g.nonempty_with(1, 4) as f64, ne),
+                pct(g.nonempty_with(1, 16) as f64, ne),
+                if ne > 0.0 { s.nonzero as f64 / ne } else { 0.0 }
+            );
+        }
+    }
+
+    let _ = writeln!(
+        m,
+        "\n## 4. Sizes: SimdBp128 breakdown and ESTIMATES (not implemented codecs)\n"
+    );
+    let _ = writeln!(
+        m,
+        "SimdBp128 is the real codec (its total equals the encoder's output, checked per row); its split is computed from the group widths. \
+         (ii) and (iii) are ESTIMATES: byte counts of formats that do not exist as code (no decoder, no speed). \
+         (ii) = per row Elias-γ(nonzero+1) + per nonzero Elias-γ(gap; first = position+1) + 8 bits, rounded up to bytes per row. \
+         (iii) = per row ⌈groups/8⌉ bytes of 1-bit-per-128-group bitmap + SimdBp128 of the non-empty groups only.\n"
+    );
+    let _ = writeln!(m, "Whole grid:\n");
+    let _ = writeln!(m, "| item | bytes | % of Raw | bits / nonzero |");
+    let _ = writeln!(m, "|---|---:|---:|---:|");
+    for (item, b) in estimate_items(o) {
+        let _ = writeln!(
+            m,
+            "| {} | {b:.1} | {:.3}% | {:.2} |",
+            item.replace("  ", "↳ "),
+            pct(b, o.values as f64),
+            if o.nonzero > 0 {
+                8.0 * b / o.nonzero as f64
+            } else {
+                0.0
+            }
+        );
+    }
+    let _ = writeln!(m, "\nPer stratum: % of Raw (bits / nonzero)\n");
+    let _ = writeln!(
+        m,
+        "| group | SimdBp128 | (ii) position + value | (iii) bitmap + SimdBp128 | nonzero × 1 B | SimdBp128 data in 1–2 nz groups, % of its bytes |"
+    );
+    let _ = writeln!(m, "|---|---:|---:|---:|---:|---:|");
+    for (name, s) in &groups {
+        let (v, nz) = (s.values as f64, s.nonzero as f64);
+        let cell = |b: f64| {
+            format!(
+                "{:.3}% ({:.1})",
+                pct(b, v),
+                if nz > 0.0 { 8.0 * b / nz } else { 0.0 }
+            )
+        };
+        let sparse = (s.est.sb128_data_bytes_by_nnz[1] + s.est.sb128_data_bytes_by_nnz[2]) as f64;
+        let _ = writeln!(
+            m,
+            "| {name} | {} | {} | {} | {} | {:.1}% |",
+            cell(s.est.sb128_bytes as f64),
+            cell(s.est.posval_bytes as f64),
+            cell(s.est.bitmap_bytes() as f64),
+            cell(nz),
+            pct(sparse, s.est.sb128_bytes as f64)
+        );
+    }
+
+    let mut f = create_new(&md)?;
+    f.write_all(m.as_bytes()).map_err(werr)?;
+    f.flush().map_err(werr)?;
+    print!("{m}");
+    eprintln!(
+        "wrote {}, {}, {}, {}, {}, {}",
+        md.display(),
+        values_csv.display(),
+        runs_csv.display(),
+        groups_csv.display(),
+        est_csv.display(),
+        per_term_csv.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opts = match parse_args(&args) {
@@ -818,6 +1253,7 @@ fn main() -> ExitCode {
     let result = match opts.mode {
         Mode::Size => run_size(&opts),
         Mode::Speed => run_speed(&opts),
+        Mode::Stats => run_stats(&opts),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -877,6 +1313,31 @@ mod tests {
         let items = vec![(1, 0), (2, 5), (3, 1), (4, 0), (5, 100)];
         let s = sample_weighted(&items, 10, &mut XorShift64::new(1));
         assert_eq!(s, vec![2, 3, 5]);
+    }
+
+    #[test]
+    fn stats_mode_parses() {
+        let o = parse_args(&args("--mode stats --grid /d/x._blocks.bin --out /r/x")).unwrap();
+        assert_eq!(o.mode, Mode::Stats);
+        assert_eq!(o.strata_grid, PathBuf::from("/d/x._superblocks.bin"));
+    }
+
+    #[test]
+    fn stats_medians() {
+        let mut h = [0u64; 256];
+        assert_eq!(median_nonzero(&h), 0); // no nonzero values
+        h[0] = 1000; // zeros are ignored
+        h[3] = 2;
+        h[10] = 1;
+        h[200] = 2;
+        assert_eq!(median_nonzero(&h), 10); // 3,3,10,200,200
+        h[10] = 0;
+        assert_eq!(median_nonzero(&h), 3); // lower median of 3,3,200,200
+        // power-of-2 buckets: 1 in bucket 0, 3 in bucket 2 (4..=7)
+        assert_eq!(median_bucket(&[1, 0, 3]), "4–7");
+        assert_eq!(median_bucket(&[3, 0, 1]), "1");
+        assert_eq!(median_bucket(&[0, 0]), "n/a");
+        assert_eq!(pct(1.0, 0.0), 0.0);
     }
 
     #[test]

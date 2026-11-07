@@ -25,6 +25,7 @@ pub mod random_access;
 pub mod raw;
 pub mod registry;
 pub mod simdbp;
+pub mod stats;
 pub mod vbyte;
 
 // Re-export the codec types so users can write `codecs::Raw` instead of `codecs::raw::Raw`.
