@@ -412,3 +412,104 @@ fn smoke_grid_end_to_end() {
         .sum();
     assert_eq!(o.est.sb128_bytes, direct_sb128);
 }
+
+// ---------------------------------------------------------------------------------------
+// (iv) hybrid estimate: per 128-group, dense (16·w bytes) or sparse (⌈15·k/8⌉ bytes, k ≤ 15),
+// plus SimdBp128's headers and 1 flag bit per group.
+// ---------------------------------------------------------------------------------------
+
+use codecs::stats::{HYBRID_MAX_SPARSE, hybrid_group_bytes};
+
+#[test]
+fn hybrid_group_choice() {
+    // 1 nonzero of 255: dense 16·8 = 128 B, sparse ⌈15/8⌉ = 2 B → sparse
+    assert_eq!(hybrid_group_bytes(1, 255), (2, true));
+    // 2 nonzeros, max 2: dense 16·2 = 32, sparse ⌈30/8⌉ = 4 → sparse
+    assert_eq!(hybrid_group_bytes(2, 2), (4, true));
+    // 15 ones: dense 16·1 = 16, sparse ⌈225/8⌉ = 29 → dense
+    assert_eq!(hybrid_group_bytes(15, 1), (16, false));
+    // 15 values up to 200: dense 128, sparse 29 → sparse (largest allowed count)
+    assert_eq!(hybrid_group_bytes(HYBRID_MAX_SPARSE, 200), (29, true));
+    // 16 values: count doesn't fit the 4-bit field → dense even though sparse (30) < 128
+    assert_eq!(hybrid_group_bytes(16, 200), (128, false));
+    // 8 nonzeros, max 7 (w = 3): dense 48, sparse ⌈120/8⌉ = 15 → sparse
+    assert_eq!(hybrid_group_bytes(8, 7), (15, true));
+    // 9 ones: dense 16, sparse ⌈135/8⌉ = 17 → dense (sparse must be strictly smaller)
+    assert_eq!(hybrid_group_bytes(9, 1), (16, false));
+    // k = 8, w = 1: dense 16, sparse 15 → sparse
+    assert_eq!(hybrid_group_bytes(8, 1), (15, true));
+}
+
+#[test]
+fn hybrid_rows_by_hand() {
+    // small row: one partial group, 4 nonzeros, max 7: dense 48, sparse ⌈60/8⌉ = 8 → sparse.
+    // 64 (header) + 1 (flags) + 8 = 73
+    let (s, r) = stats_of(&[0u8, 5, 0, 0, 7, 7, 0, 0, 0, 1]);
+    assert_eq!(r.hybrid_bytes, 73);
+    assert_eq!(
+        (s.est.hybrid_sparse_groups, s.est.hybrid_dense_groups),
+        (1, 0)
+    );
+    assert_eq!(s.est.hybrid_sparse_nonzeros, 4);
+    // all zero, 300 values: 64 + ⌈3/8⌉ = 65
+    assert_eq!(stats_of(&[0u8; 300]).1.hybrid_bytes, 65);
+    // 600 values: group 0 has 255 (sparse 2 B), group 1 has 1, 2 (sparse 4 B), 3 empty groups:
+    // 64 + ⌈5/8⌉ + 6 = 71  (SimdBp128 was 224)
+    let mut row = vec![0u8; 600];
+    row[0] = 255;
+    row[130] = 1;
+    row[131] = 2;
+    let (s, r) = stats_of(&row);
+    assert_eq!(r.hybrid_bytes, 71);
+    assert_eq!(
+        (s.est.hybrid_sparse_bytes, s.est.hybrid_dense_bytes),
+        (6, 0)
+    );
+    // dense group: 128 × 255 → dense 128 B: 64 + 1 + 128 = 193
+    let (s, r) = stats_of(&[255u8; 128]);
+    assert_eq!(r.hybrid_bytes, 193);
+    assert_eq!(
+        (s.est.hybrid_dense_groups, s.est.hybrid_sparse_groups),
+        (1, 0)
+    );
+    // two metablocks, one nonzero (1) at the end: 128 + ⌈129/8⌉ = 17 + 2 = 147
+    let mut row = vec![0u8; 128 * 128 + 1];
+    *row.last_mut().unwrap() = 1;
+    assert_eq!(stats_of(&row).1.hybrid_bytes, 147);
+    // empty row: nothing
+    assert_eq!(stats_of(&[]).1.hybrid_bytes, 0);
+}
+
+#[test]
+fn hybrid_random_rows_match_model() {
+    for row in random_rows() {
+        let (s, r) = stats_of(&row);
+        // independent model, straight from the definition
+        let groups = row.len().div_ceil(128);
+        let mut expect = (groups.div_ceil(128) * 64 + groups.div_ceil(8)) as u64;
+        for g in row.chunks(128) {
+            let k = g.iter().filter(|&&v| v != 0).count() as u64;
+            let w = g
+                .iter()
+                .map(|&v| 8 - v.leading_zeros() as u64)
+                .max()
+                .unwrap_or(0);
+            let dense = 16 * w;
+            let sparse = (15 * k).div_ceil(8);
+            expect += if (1..=15).contains(&k) && sparse < dense {
+                sparse
+            } else {
+                dense
+            };
+        }
+        assert_eq!(r.hybrid_bytes, expect, "n={}", row.len());
+        assert_eq!(s.est.hybrid_bytes(), expect);
+        // never worse than SimdBp128 plus the flag bytes
+        assert!(r.hybrid_bytes <= r.sb128_bytes + groups.div_ceil(8) as u64);
+        // every non-empty group is counted once
+        assert_eq!(
+            s.est.hybrid_dense_groups + s.est.hybrid_sparse_groups,
+            s.groups[0].nonempty_groups()
+        );
+    }
+}

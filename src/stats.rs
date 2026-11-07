@@ -27,6 +27,18 @@
 //!   whole bytes per row) saying whether it is all zero, plus SimdBp128 of the non-empty
 //!   groups only, concatenated in order. [`check_row_estimates`] checks the SimdBp128
 //!   part against the real encoder on the compacted row.
+//! - (iv) **hybrid** (ESTIMATE, like Roaring bitmaps' array vs bitmap containers): keeps
+//!   SimdBp128's group structure, so a group's byte offset still comes from the headers
+//!   alone (random access). Per row: the same metablock headers (64 B per 128 groups,
+//!   4 bits per group) plus 1 flag bit per group (⌈groups/8⌉ bytes). Each non-empty
+//!   128-group is stored either
+//!   - **dense**: bit-packed at its width w, exactly as SimdBp128 (16·w bytes), or
+//!   - **sparse**: its k nonzeros as (7-bit position in the group, 8-bit value) pairs,
+//!     ⌈15·k / 8⌉ bytes (byte-aligned per group). Its 4-bit header field then holds k
+//!     instead of w, so sparse needs k ≤ [`HYBRID_MAX_SPARSE`] (15).
+//!
+//!   A group is sparse when that is allowed and strictly smaller; all-zero groups cost
+//!   0 data bytes either way.
 //!
 //! Everything is integer counting, so the totals are exact; merging strata
 //! ([`Stats::merge`]) gives the same numbers as one scan over all rows.
@@ -45,6 +57,25 @@ pub const N_LOG2_BUCKETS: usize = 41;
 /// SimdBp128 group length (16 × STRIDE 8), which is also the number of groups that
 /// share one metablock header.
 pub const SB128_GROUP: usize = 128;
+
+/// (iv) hybrid: most nonzeros a sparse group can hold (its count must fit the 4-bit
+/// header field).
+pub const HYBRID_MAX_SPARSE: usize = 15;
+
+/// (iv) hybrid: bits per sparse entry = 7-bit position within a 128-group + 8-bit value.
+pub const HYBRID_ENTRY_BITS: u64 = 7 + 8;
+
+/// (iv) hybrid: data bytes of one non-empty 128-group with `nnz` nonzeros and largest
+/// value `max`, and whether it is stored sparse.
+pub fn hybrid_group_bytes(nnz: usize, max: u8) -> (u64, bool) {
+    let dense = SimdBp128::group_data_bytes(bit_width(max) as usize) as u64;
+    let sparse = (HYBRID_ENTRY_BITS * nnz as u64).div_ceil(8);
+    if nnz > 0 && nnz <= HYBRID_MAX_SPARSE && sparse < dense {
+        (sparse, true)
+    } else {
+        (dense, false)
+    }
+}
 
 /// Floor of log2(x), i.e. the power-of-2 bucket of `x`. `x` must be at least 1.
 pub fn log2_bucket(x: u64) -> usize {
@@ -130,6 +161,19 @@ pub struct Estimates {
     pub bitmap_bitmap_bytes: u64,
     /// (iii) SimdBp128 of the non-empty groups only.
     pub bitmap_simdbp_bytes: u64,
+    /// (iv) hybrid: metablock headers (same as SimdBp128's).
+    pub hybrid_header_bytes: u64,
+    /// (iv) hybrid: the sparse/dense flags, ⌈groups / 8⌉ bytes per row.
+    pub hybrid_flag_bytes: u64,
+    /// (iv) hybrid: data of groups stored dense (bit-packed).
+    pub hybrid_dense_bytes: u64,
+    /// (iv) hybrid: data of groups stored sparse (position + value pairs).
+    pub hybrid_sparse_bytes: u64,
+    /// (iv) hybrid: number of non-empty groups stored dense / sparse.
+    pub hybrid_dense_groups: u64,
+    pub hybrid_sparse_groups: u64,
+    /// (iv) hybrid: nonzeros that ended up in sparse groups.
+    pub hybrid_sparse_nonzeros: u64,
 }
 
 impl Estimates {
@@ -145,11 +189,25 @@ impl Estimates {
             posval_bytes: 0,
             bitmap_bitmap_bytes: 0,
             bitmap_simdbp_bytes: 0,
+            hybrid_header_bytes: 0,
+            hybrid_flag_bytes: 0,
+            hybrid_dense_bytes: 0,
+            hybrid_sparse_bytes: 0,
+            hybrid_dense_groups: 0,
+            hybrid_sparse_groups: 0,
+            hybrid_sparse_nonzeros: 0,
         }
     }
     /// (iii) total: bitmap + SimdBp128 on the non-empty groups.
     pub fn bitmap_bytes(&self) -> u64 {
         self.bitmap_bitmap_bytes + self.bitmap_simdbp_bytes
+    }
+    /// (iv) total: headers + flags + dense data + sparse data.
+    pub fn hybrid_bytes(&self) -> u64 {
+        self.hybrid_header_bytes
+            + self.hybrid_flag_bytes
+            + self.hybrid_dense_bytes
+            + self.hybrid_sparse_bytes
     }
 }
 
@@ -168,6 +226,8 @@ pub struct RowSummary {
     pub posval_bytes: u64,
     pub bitmap_bitmap_bytes: u64,
     pub bitmap_simdbp_bytes: u64,
+    /// (iv) hybrid total for this row.
+    pub hybrid_bytes: u64,
 }
 
 /// Statistics over a set of rows (one stratum, or the whole grid).
@@ -250,6 +310,13 @@ impl Stats {
         e.posval_bytes += o.posval_bytes;
         e.bitmap_bitmap_bytes += o.bitmap_bitmap_bytes;
         e.bitmap_simdbp_bytes += o.bitmap_simdbp_bytes;
+        e.hybrid_header_bytes += o.hybrid_header_bytes;
+        e.hybrid_flag_bytes += o.hybrid_flag_bytes;
+        e.hybrid_dense_bytes += o.hybrid_dense_bytes;
+        e.hybrid_sparse_bytes += o.hybrid_sparse_bytes;
+        e.hybrid_dense_groups += o.hybrid_dense_groups;
+        e.hybrid_sparse_groups += o.hybrid_sparse_groups;
+        e.hybrid_sparse_nonzeros += o.hybrid_sparse_nonzeros;
     }
 
     /// Scans one row and adds it to these statistics. Returns the row's own numbers.
@@ -339,6 +406,25 @@ impl Stats {
         e.bitmap_bitmap_bytes += bitmap_bitmap_bytes;
         e.bitmap_simdbp_bytes += bitmap_simdbp_bytes;
 
+        // ---- (iv) hybrid: per non-empty group, the cheaper of dense and sparse ----
+        let mut hybrid_data = 0u64;
+        for c in chunks.iter().filter(|c| c.nnz > 0) {
+            let (bytes, sparse) = hybrid_group_bytes(c.nnz, c.max);
+            hybrid_data += bytes;
+            if sparse {
+                e.hybrid_sparse_bytes += bytes;
+                e.hybrid_sparse_groups += 1;
+                e.hybrid_sparse_nonzeros += c.nnz as u64;
+            } else {
+                e.hybrid_dense_bytes += bytes;
+                e.hybrid_dense_groups += 1;
+            }
+        }
+        let hybrid_flag_bytes = n_groups.div_ceil(8) as u64;
+        e.hybrid_header_bytes += header_bytes;
+        e.hybrid_flag_bytes += hybrid_flag_bytes;
+        let hybrid_bytes = header_bytes + hybrid_flag_bytes + hybrid_data;
+
         RowSummary {
             n_values: n,
             nonzero,
@@ -351,6 +437,7 @@ impl Stats {
             posval_bytes,
             bitmap_bitmap_bytes,
             bitmap_simdbp_bytes,
+            hybrid_bytes,
         }
     }
 

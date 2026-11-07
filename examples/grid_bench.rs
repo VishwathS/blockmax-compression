@@ -895,6 +895,17 @@ fn estimate_items(s: &Stats) -> Vec<(&'static str, f64)> {
             "  SimdBp128 on non-empty groups",
             e.bitmap_simdbp_bytes as f64,
         ),
+        (
+            "ESTIMATE (iv) hybrid: per-group dense or sparse",
+            e.hybrid_bytes() as f64,
+        ),
+        ("  headers (as SimdBp128)", e.hybrid_header_bytes as f64),
+        ("  sparse/dense flags", e.hybrid_flag_bytes as f64),
+        ("  dense groups (bit-packed)", e.hybrid_dense_bytes as f64),
+        (
+            "  sparse groups (position + value)",
+            e.hybrid_sparse_bytes as f64,
+        ),
         ("nonzero × 1 B (reference)", s.nonzero as f64),
     ]
 }
@@ -920,7 +931,7 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
 
     // ---- the scan: one row at a time, per-term line written as we go ----
     let mut per_term = create_new(&per_term_csv)?;
-    writeln!(per_term, "term,stratum,n_values,nonzero,max,groups_128,zero_groups_128,groups_128_nnz1,groups_128_nnz2,simdbp128_bytes,posval_bytes,bitmap_bytes")
+    writeln!(per_term, "term,stratum,n_values,nonzero,max,groups_128,zero_groups_128,groups_128_nnz1,groups_128_nnz2,simdbp128_bytes,posval_bytes,bitmap_bytes,hybrid_bytes")
         .map_err(|e| e.to_string())?;
     let start = Instant::now();
     let n_terms = grid.n_terms();
@@ -928,7 +939,7 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
     let scan: StatsScan = stats_scan(&grid, &strata, |term, stratum, r| {
         if let Err(e) = writeln!(
             per_term,
-            "{term},{stratum},{},{},{},{},{},{},{},{},{},{}",
+            "{term},{stratum},{},{},{},{},{},{},{},{},{},{},{}",
             r.n_values,
             r.nonzero,
             r.max,
@@ -938,7 +949,8 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
             r.groups_128_nnz2,
             r.sb128_bytes,
             r.posval_bytes,
-            r.bitmap_bitmap_bytes + r.bitmap_simdbp_bytes
+            r.bitmap_bitmap_bytes + r.bitmap_simdbp_bytes,
+            r.hybrid_bytes
         ) {
             io_error.get_or_insert(e);
         }
@@ -1174,7 +1186,8 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
         "SimdBp128 is the real codec (its total equals the encoder's output, checked per row); its split is computed from the group widths. \
          (ii) and (iii) are ESTIMATES: byte counts of formats that do not exist as code (no decoder, no speed). \
          (ii) = per row Elias-γ(nonzero+1) + per nonzero Elias-γ(gap; first = position+1) + 8 bits, rounded up to bytes per row. \
-         (iii) = per row ⌈groups/8⌉ bytes of 1-bit-per-128-group bitmap + SimdBp128 of the non-empty groups only.\n"
+         (iii) = per row ⌈groups/8⌉ bytes of 1-bit-per-128-group bitmap + SimdBp128 of the non-empty groups only. \
+         (iv) hybrid (ESTIMATE) = SimdBp128's 128-groups and headers (random access kept) + 1 flag bit per group; each non-empty group is stored dense (bit-packed, 16·w B) or sparse ((7-bit position, 8-bit value) pairs, ⌈15k/8⌉ B; only if k ≤ 15 so the count fits the 4-bit header field), whichever is strictly smaller.\n"
     );
     let _ = writeln!(m, "Whole grid:\n");
     let _ = writeln!(m, "| item | bytes | % of Raw | bits / nonzero |");
@@ -1195,9 +1208,9 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
     let _ = writeln!(m, "\nPer stratum: % of Raw (bits / nonzero)\n");
     let _ = writeln!(
         m,
-        "| group | SimdBp128 | (ii) position + value | (iii) bitmap + SimdBp128 | nonzero × 1 B | SimdBp128 data in 1–2 nz groups, % of its bytes |"
+        "| group | SimdBp128 | (ii) position + value | (iii) bitmap + SimdBp128 | (iv) hybrid | nonzero × 1 B | SimdBp128 data in 1–2 nz groups, % of its bytes | hybrid: % of non-empty groups sparse | hybrid: % of nonzeros in sparse groups |"
     );
-    let _ = writeln!(m, "|---|---:|---:|---:|---:|---:|");
+    let _ = writeln!(m, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     for (name, s) in &groups {
         let (v, nz) = (s.values as f64, s.nonzero as f64);
         let cell = |b: f64| {
@@ -1210,12 +1223,18 @@ fn run_stats(opts: &Opts) -> Result<(), String> {
         let sparse = (s.est.sb128_data_bytes_by_nnz[1] + s.est.sb128_data_bytes_by_nnz[2]) as f64;
         let _ = writeln!(
             m,
-            "| {name} | {} | {} | {} | {} | {:.1}% |",
+            "| {name} | {} | {} | {} | {} | {} | {:.1}% | {:.1}% | {:.1}% |",
             cell(s.est.sb128_bytes as f64),
             cell(s.est.posval_bytes as f64),
             cell(s.est.bitmap_bytes() as f64),
+            cell(s.est.hybrid_bytes() as f64),
             cell(nz),
-            pct(sparse, s.est.sb128_bytes as f64)
+            pct(sparse, s.est.sb128_bytes as f64),
+            pct(
+                s.est.hybrid_sparse_groups as f64,
+                (s.est.hybrid_sparse_groups + s.est.hybrid_dense_groups) as f64
+            ),
+            pct(s.est.hybrid_sparse_nonzeros as f64, nz)
         );
     }
 
