@@ -65,11 +65,14 @@ Build: `nice -n 10 cargo build --release --example grid_bench`.
   size ESTIMATES for sparse/hybrid formats (`src/stats.rs`). SimdBp128 numbers are
   checked against the real encoder.
 Rules for running it:
-- `nice -n 10 taskset -c 2 target/release/examples/grid_bench --mode ... --grid ... --out ...`
-- One run at a time. Check `uptime` and `free -g` first.
+- Claude may run it itself, including full-grid scans:
+  `nice -n 10 taskset -c 2 target/release/examples/grid_bench --mode ... --grid ... --out ...`
+- One run at a time. Check `uptime` and `free -g` first; if other users' load or memory
+  use is high, wait and tell the user.
 - Outputs go to `~/lsp-work/results/<name>`; never overwrite (the program refuses to
   start if an output exists; pick a new name such as `_r2`).
-- Full blocks-grid scans take minutes: write a script, the user runs it in tmux.
+- Check with the user first for: Parker's tools (only via the vetted scripts, see
+  `~/lsp-work/CLAUDE.md`) and anything that may need more than ~1 GB of RAM.
 
 ## Crate facts
 - `BlockCodec` (`src/lib.rs`): values are `u16 <= 255`. `encode(input, out)` appends a

@@ -455,15 +455,13 @@ Keep these distinctions in mind when reading results:
 - A test that compares our encoder with our decoder doesn't verify the format.
 - A hash match shows agreement for the tested input, not compatibility in general.
 
-### Roadmap (see `CLAUDE.md`)
-Done: 1. Raw + VByte, 2. Bp128, 3. codec registry, 4. random access
-(`RandomAccessCodec` + `GroupIndex`), 5. Parker SIMDBP integration and the correctness
-audit (`SimdBp128/256/512`, byte-identical to Parker's `compress`). Next: 6. seeded
-synthetic data infrastructure, 7. CLI and experiment configuration, 8. real-data
-loading (`export_data` matrices), pending Parker's guidance and data, 9. benchmarking
-methodology and experiments (criterion speed + bytes per value on real data; include
-one-shot vs. `GroupIndex` lookup, `GroupIndex` build cost per term, scalar vs SIMD
-kernels), pending discussion with Parker.
+### Status (same as `CLAUDE.md`)
+Done (all on `main`): Raw, VByte, Bp128, codec registry, random access, the SIMDBP port
+and its correctness audit, the real-data grid loader with `grid_bench` size/speed
+modes, and the stats mode with analytic size estimates (incl. the hybrid estimate).
+
+Next: prototype the **hybrid group format** (sparse groups stored as position + value
+pairs, dense groups bit-packed). Measure decode speed first, then size.
 
 ## (b) Questions to verify yourself (not answered here)
 
